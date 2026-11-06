@@ -11,7 +11,7 @@
 //           SYNC_OFFSET_MS (optional: shift all subtitles, in ms)
 //           OS_API_BASE, WYZIE_BASE (optional, testing only)
 
-const UA = "NuvioSdhDe v2.1.1";
+const UA = "NuvioSdhDe v2.1.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 
