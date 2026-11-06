@@ -12,10 +12,10 @@ const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 // ---- Settings you may want to change -------------------------------------
 const ARABIC_SDH_ONLY = false;     // true = only use Arabic files flagged SDH (rare)
 const ARABIC_COLOR = "#FFEB3B";    // colour of the Arabic lines ("" = no colour tag)
-const DUAL_OPTIONS = 3;            // how many dual (German+Arabic) choices to list
+const DUAL_OPTIONS = 5;            // how many dual (German+Arabic) choices to list
 const GERMAN_ONLY_OPTIONS = 2;     // how many plain German SDH choices to list
 const READ_MS_PER_CHAR = 55;       // minimum on-screen time per character (about 18 chars/second)
-const MIN_CUE_MS = 1500;           // no subtitle stays shorter than this (if the next one allows)
+const MIN_CUE_MS = 2000;           // no subtitle stays shorter than this (if the next one allows)
 const MAX_CUE_MS = 7000;
 // Shift every subtitle later (+) or earlier (-), in milliseconds. Set it in Vercel as the
 // environment variable SYNC_OFFSET_MS if everything is consistently early or late.
@@ -171,7 +171,7 @@ function bestArabicFor(de, arList, fileTokens) {
 // ===== SRT parsing / alignment / merging =====================================
 
 function parseSrt(text) {
-  text = text.replace(/^/, "").replace(/\r/g, "");
+  text = text.replace(/^﻿/, "").replace(/\r/g, "");
   const cues = [];
   for (const block of text.split(/\n\s*\n/)) {
     const lines = block.split("\n");
@@ -194,12 +194,11 @@ function fmtTime(t) {
   return `${p(h)}:${p(m)}:${p(s)},${p(ms, 3)}`;
 }
 
-// Fixed the syntax cut-off errors that were present around your previous line 174 text replacements
 function toSrt(cues) {
   return cues.map((c, i) => `${i + 1}\n${fmtTime(c.start)} --> ${fmtTime(c.end)}\n${c.text}\n`).join("\n");
 }
 
-const BIDI = /[?‏?-?? -?]/g;
+const BIDI = /[‎‏‪-‮⁦-⁩]/g;
 const plain = (t) => t.replace(/<[^>]+>/g, "").replace(BIDI, "");
 
 // Finds the shift (and frame-rate stretch) that best lines the Arabic file up with the German one,
@@ -237,9 +236,7 @@ function bestAlignment(de, ar) {
       if (sc > best.score) best = { r, off, score: sc };
     }
   }
-
-  // Modified: Relaxes constraint thresholds to guarantee timing synchronization rules execute
-  if (best.score === -1 || best.score === 0) return identity;
+  if (!(best.score >= base * 1.15 && best.score >= sample.length * 0.15)) return identity;
 
   // Millisecond refinement: median remaining difference of matched cue starts.
   const scaled = ar.map((c) => c.start * best.r);
@@ -267,9 +264,7 @@ function fixArabicLine(line) {
   l = l.replace(/\?/g, "؟").replace(/(?<!\d),|,(?!\d)/g, "،");
   // RLM + RLE ... PDF + RLM: whole line is right-to-left and trailing punctuation stays at the left end.
   const wrapped = `‏‫${l}‬‏`;
-  
-  // Modified: Added size="5" formatting to expand layout size profile inside video engines
-  return ARABIC_COLOR ? `<font size="5" color="${ARABIC_COLOR}">${wrapped}</font>` : `<font size="5">${wrapped}</font>`;
+  return ARABIC_COLOR ? `<font color="${ARABIC_COLOR}">${wrapped}</font>` : wrapped;
 }
 
 function arabicBlock(text) {
@@ -329,15 +324,7 @@ function finalize(cues) {
 
 function germanOnly(text) {
   const cues = mergeFragments(parseSrt(text));
-  if (cues.length) {
-    // Wrap plain tracks with size markers for render balance across full configurations
-    const customized = cues.map(c => ({
-      ...c,
-      text: `<font size="5">${c.text}</font>`
-    }));
-    return finalize(customized);
-  }
-  return text;
+  return cues.length ? finalize(cues) : text;
 }
 
 function mergeDual(deText, arText) {
@@ -365,9 +352,7 @@ function mergeDual(deText, arText) {
       const o = Math.min(d.end, a.end) - Math.max(d.start, a.start);
       if (o > bestO) { bestO = o; bestI = i; }
     }
-    
-    // Modified: Tightened minimum window properties down to 50ms overlap to trap matching blocks
-    const need = bestI >= 0 ? 50 : 0;
+    const need = bestI >= 0 ? Math.min(300, 0.3 * Math.min(a.end - a.start, de[bestI].end - de[bestI].start)) : 0;
     if (bestI >= 0 && bestO >= need) attached[bestI].push(a.text);
     else standalone.push(a);
   }
@@ -375,10 +360,7 @@ function mergeDual(deText, arText) {
   const out = de.map((d, i) => ({
     start: d.start,
     end: d.end,
-    // Applied font scaling modifications into the parent German elements here as well
-    text: attached[i].length 
-      ? `<font size="5">${d.text}</font>\n${attached[i].join("\n")}` 
-      : `<font size="5">${d.text}</font>`
+    text: attached[i].length ? `${d.text}\n${attached[i].join("\n")}` : d.text
   }));
   // Arabic cues that matched no German cue are kept, so no translation is lost.
   for (const a of standalone) out.push({ start: a.start, end: a.end, text: a.text });
@@ -511,4 +493,3 @@ module.exports = async (req, res) => {
     res.end("Upstream error");
   }
 };
-
