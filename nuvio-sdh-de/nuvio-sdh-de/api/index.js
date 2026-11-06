@@ -14,6 +14,13 @@ const ARABIC_SDH_ONLY = false;     // true = only use Arabic files flagged SDH (
 const ARABIC_COLOR = "#FFEB3B";    // colour of the Arabic lines ("" = no colour tag)
 const DUAL_OPTIONS = 3;            // how many dual (German+Arabic) choices to list
 const GERMAN_ONLY_OPTIONS = 2;     // how many plain German SDH choices to list
+const READ_MS_PER_CHAR = 55;       // minimum on-screen time per character (about 18 chars/second)
+const MIN_CUE_MS = 1500;           // no subtitle stays shorter than this (if the next one allows)
+const MAX_CUE_MS = 7000;
+// Shift every subtitle later (+) or earlier (-), in milliseconds. Set it in Vercel as the
+// environment variable SYNC_OFFSET_MS if everything is consistently early or late.
+const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
+const CACHE_V = "3";               // bump to force players/CDN to re-fetch subtitle files
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -191,20 +198,24 @@ function toSrt(cues) {
   return cues.map((c, i) => `${i + 1}\n${fmtTime(c.start)} --> ${fmtTime(c.end)}\n${c.text}\n`).join("\n");
 }
 
-// Finds the shift (and frame-rate stretch) that best lines the Arabic file up with the German one.
+const BIDI = /[‎‏‪-‮⁦-⁩]/g;
+const plain = (t) => t.replace(/<[^>]+>/g, "").replace(BIDI, "");
+
+// Finds the shift (and frame-rate stretch) that best lines the Arabic file up with the German one,
+// then refines the shift to the millisecond.
 function bestAlignment(de, ar) {
   const identity = { r: 1, off: 0 };
   if (!de.length || !ar.length) return identity;
 
-  const nearest = (arr, t) => {
+  const near = (arr, t) => {
     let lo = 0, hi = arr.length - 1;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
       if (arr[mid] < t) lo = mid + 1; else hi = mid;
     }
-    let d = Math.abs(arr[lo] - t);
-    if (lo > 0) d = Math.min(d, Math.abs(arr[lo - 1] - t));
-    return d;
+    let v = arr[lo];
+    if (lo > 0 && Math.abs(arr[lo - 1] - t) < Math.abs(v - t)) v = arr[lo - 1];
+    return v;
   };
 
   const step = Math.max(1, Math.ceil(de.length / 600));
@@ -217,31 +228,109 @@ function bestAlignment(de, ar) {
     const scaled = ar.map((c) => c.start * r);
     for (let off = -15000; off <= 15000; off += 250) {
       let sc = 0;
-      for (const c of sample) if (nearest(scaled, c.start - off) <= 700) sc++;
+      for (const c of sample) {
+        const t = c.start - off;
+        if (Math.abs(near(scaled, t) - t) <= 700) sc++;
+      }
       if (r === 1 && off === 0) base = sc;
       if (sc > best.score) best = { r, off, score: sc };
     }
   }
-  if (best.score >= base * 1.15 && best.score >= sample.length * 0.15) return { r: best.r, off: best.off };
-  return identity;
+  if (!(best.score >= base * 1.15 && best.score >= sample.length * 0.15)) return identity;
+
+  // Millisecond refinement: median remaining difference of matched cue starts.
+  const scaled = ar.map((c) => c.start * best.r);
+  const diffs = [];
+  for (const c of sample) {
+    const t = c.start - best.off;
+    const d = t - near(scaled, t);
+    if (Math.abs(d) <= 700) diffs.push(d);
+  }
+  diffs.sort((x, y) => x - y);
+  const fine = diffs.length ? diffs[diffs.length >> 1] : 0;
+  return { r: best.r, off: Math.round(best.off + fine) };
+}
+
+// Arabic needs explicit right-to-left handling, otherwise "?" "." "!" jump to the wrong end of the line.
+function fixArabicLine(line) {
+  let l = line.replace(BIDI, "").trim();
+  if (!l) return "";
+  // A question/exclamation mark typed at the logical START of the line belongs at the end.
+  const m = l.match(/^(-\s*)?([?؟!]+)\s*(.+)$/);
+  if (m) {
+    const endsWithMark = /[?؟!]$/.test(m[3]);
+    l = `${m[1] || ""}${m[3]}${endsWithMark ? "" : m[2]}`;
+  }
+  l = l.replace(/\?/g, "؟").replace(/(?<!\d),|,(?!\d)/g, "،");
+  // RLM + RLE ... PDF + RLM: whole line is right-to-left and trailing punctuation stays at the left end.
+  const wrapped = `‏‫${l}‬‏`;
+  return ARABIC_COLOR ? `<font color="${ARABIC_COLOR}">${wrapped}</font>` : wrapped;
 }
 
 function arabicBlock(text) {
   return text
     .replace(/<[^>]+>/g, "")
     .split("\n")
-    .map((l) => l.trim())
+    .map(fixArabicLine)
     .filter(Boolean)
-    .map((l) => {
-      const line = `‏${l}`;
-      return ARABIC_COLOR ? `<font color="${ARABIC_COLOR}">${line}</font>` : line;
-    })
     .join("\n");
 }
 
+// Joins German cues that are one sentence cut in two (no end punctuation, tiny gap).
+function mergeFragments(cues) {
+  const out = [];
+  for (const c of cues) {
+    const prev = out[out.length - 1];
+    if (prev) {
+      const a = plain(prev.text).trim();
+      const b = plain(c.text).trim();
+      const complete = /[.?!…؟»"'\])]$/.test(a);
+      if (!complete && c.start - prev.end <= 400 && !/^[-–—\[(]/.test(b) && a.length + b.length <= 84) {
+        prev.text = `${prev.text.replace(/\n/g, " ")} ${c.text.replace(/\n/g, " ")}`;
+        prev.end = Math.max(prev.end, c.end);
+        continue;
+      }
+    }
+    out.push({ ...c });
+  }
+  return out;
+}
+
+// Gives every cue enough time to be read (never shortens, never runs into the next cue).
+function fixDurations(cues) {
+  for (let i = 0; i < cues.length; i++) {
+    const c = cues[i];
+    const next = cues[i + 1];
+    const chars = plain(c.text).replace(/\s+/g, " ").trim().length;
+    const want = Math.min(MAX_CUE_MS, Math.max(MIN_CUE_MS, chars * READ_MS_PER_CHAR));
+    let end = Math.max(c.end, c.start + want);
+    if (next) end = Math.min(end, Math.max(c.end, next.start - 60));
+    c.end = end;
+  }
+  return cues;
+}
+
+function finalize(cues) {
+  cues.sort((a, b) => a.start - b.start);
+  fixDurations(cues);
+  if (SYNC_OFFSET_MS) {
+    for (const c of cues) {
+      c.start += SYNC_OFFSET_MS;
+      c.end += SYNC_OFFSET_MS;
+    }
+  }
+  return toSrt(cues);
+}
+
+function germanOnly(text) {
+  const cues = mergeFragments(parseSrt(text));
+  return cues.length ? finalize(cues) : text;
+}
+
 function mergeDual(deText, arText) {
-  const de = parseSrt(deText);
+  const de = mergeFragments(parseSrt(deText));
   const arRaw = parseSrt(arText);
+  if (!de.length) return deText;
   const al = bestAlignment(de, arRaw);
   const ar = arRaw
     .map((c) => ({
@@ -251,27 +340,31 @@ function mergeDual(deText, arText) {
     }))
     .filter((c) => c.text);
 
-  const used = new Set();
-  const out = [];
-  for (const d of de) {
-    const lines = [];
-    ar.forEach((a, j) => {
-      if (a.end < d.start - 1000 || a.start > d.end + 1000) return;
-      const overlap = Math.min(d.end, a.end) - Math.max(d.start, a.start);
-      const need = Math.min(300, 0.3 * Math.min(d.end - d.start, a.end - a.start));
-      if (overlap > 0 && overlap >= need) {
-        lines.push(a.text);
-        used.add(j);
-      }
-    });
-    out.push({ start: d.start, end: d.end, text: lines.length ? `${d.text}\n${lines.join("\n")}` : d.text });
+  // Each Arabic cue is attached ONCE, to the German cue it overlaps most.
+  const attached = de.map(() => []);
+  const standalone = [];
+  for (const a of ar) {
+    let bestI = -1, bestO = 0;
+    for (let i = 0; i < de.length; i++) {
+      const d = de[i];
+      if (d.start > a.end) break;
+      if (d.end < a.start) continue;
+      const o = Math.min(d.end, a.end) - Math.max(d.start, a.start);
+      if (o > bestO) { bestO = o; bestI = i; }
+    }
+    const need = bestI >= 0 ? Math.min(300, 0.3 * Math.min(a.end - a.start, de[bestI].end - de[bestI].start)) : 0;
+    if (bestI >= 0 && bestO >= need) attached[bestI].push(a.text);
+    else standalone.push(a);
   }
-  // Keep Arabic cues that matched no German cue so no translation is lost.
-  ar.forEach((a, j) => {
-    if (!used.has(j)) out.push({ start: a.start, end: a.end, text: a.text });
-  });
-  out.sort((a, b) => a.start - b.start);
-  return toSrt(out);
+
+  const out = de.map((d, i) => ({
+    start: d.start,
+    end: d.end,
+    text: attached[i].length ? `${d.text}\n${attached[i].join("\n")}` : d.text
+  }));
+  // Arabic cues that matched no German cue are kept, so no translation is lost.
+  for (const a of standalone) out.push({ start: a.start, end: a.end, text: a.text });
+  return finalize(out);
 }
 
 // ===== HTTP handler ==========================================================
@@ -355,7 +448,7 @@ module.exports = async (req, res) => {
             if (a) {
               subtitles.push({
                 id: `dual-${i + 1}-${d.fileId}-${a.fileId}`,
-                url: `${base}/dual/${d.fileId}-${a.fileId}.srt`,
+                url: `${base}/dual/${d.fileId}-${a.fileId}.v${CACHE_V}.srt`,
                 lang: "ger"
               });
             }
@@ -363,14 +456,14 @@ module.exports = async (req, res) => {
         }
         // Plain German SDH alternatives, in case a dual one is off for your video.
         de.slice(0, GERMAN_ONLY_OPTIONS).forEach((d, i) => {
-          subtitles.push({ id: `de-sdh-${i + 1}-${d.fileId}`, url: `${base}/dl/${d.fileId}.srt`, lang: "ger" });
+          subtitles.push({ id: `de-sdh-${i + 1}-${d.fileId}`, url: `${base}/dl/${d.fileId}.v${CACHE_V}.srt`, lang: "ger" });
         });
       }
       return sendJson(res, 200, { subtitles }, "public, s-maxage=3600");
     }
 
     if (parts[0] === "dual" && parts[1]) {
-      const m = parts[1].match(/^(\d+)-(\d+)\.srt$/);
+      const m = parts[1].match(/^(\d+)-(\d+)(?:\.v\d+)?\.srt$/);
       if (!m) {
         res.statusCode = 400;
         return res.end("Bad id");
@@ -379,16 +472,16 @@ module.exports = async (req, res) => {
         download(m[1]),
         download(m[2]).catch((e) => { console.error(e); return null; })
       ]);
-      return sendSrt(res, arText ? mergeDual(deText, arText) : deText);
+      return sendSrt(res, arText ? mergeDual(deText, arText) : germanOnly(deText));
     }
 
     if (parts[0] === "dl" && parts[1]) {
-      const fileId = parts[1].replace(/\.srt$/, "");
+      const fileId = parts[1].replace(/(?:\.v\d+)?\.srt$/, "");
       if (!/^\d+$/.test(fileId)) {
         res.statusCode = 400;
         return res.end("Bad id");
       }
-      return sendSrt(res, await download(fileId));
+      return sendSrt(res, germanOnly(await download(fileId)));
     }
 
     res.statusCode = 404;
