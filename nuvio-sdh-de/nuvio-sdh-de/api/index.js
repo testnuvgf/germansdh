@@ -171,21 +171,16 @@ function bestArabicFor(de, arList, fileTokens) {
 // ===== SRT parsing / alignment / merging =====================================
 
 function parseSrt(text) {
-  text = text.replace(/^/, "").replace(/
-/g, "");
+  text = text.replace(/^/, "").replace(/\r/g, "");
   const cues = [];
-  for (const block of text.split(/
-\s*
-/)) {
-    const lines = block.split("
-");
+  for (const block of text.split(/\n\s*\n/)) {
+    const lines = block.split("\n");
     const idx = lines.findIndex((l) => l.includes("-->"));
     if (idx < 0) continue;
     const m = lines[idx].match(/(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)/);
     if (!m) continue;
     const ms = (h, mi, s, f) => ((+h * 60 + +mi) * 60 + +s) * 1000 + +String(f).padEnd(3, "0").slice(0, 3);
-    const body = lines.slice(idx + 1).join("
-").replace(/\{\[^}]*\}/g, "").trim();
+    const body = lines.slice(idx + 1).join("\n").replace(/\{\\[^}]*\}/g, "").trim();
     if (!body) continue;
     cues.push({ start: ms(m[1], m[2], m[3], m[4]), end: ms(m[5], m[6], m[7], m[8]), text: body });
   }
@@ -199,15 +194,12 @@ function fmtTime(t) {
   return `${p(h)}:${p(m)}:${p(s)},${p(ms, 3)}`;
 }
 
+// Fixed the syntax cut-off errors that were present around your previous line 174 text replacements
 function toSrt(cues) {
-  return cues.map((c, i) => `${i + 1}
-${fmtTime(c.start)} --> ${fmtTime(c.end)}
-${c.text}
-`).join("
-");
+  return cues.map((c, i) => `${i + 1}\n${fmtTime(c.start)} --> ${fmtTime(c.end)}\n${c.text}\n`).join("\n");
 }
 
-const BIDI = /[‎‏‪-‮⁦-⁩]/g;
+const BIDI = /[?‏?-?? -?]/g;
 const plain = (t) => t.replace(/<[^>]+>/g, "").replace(BIDI, "");
 
 // Finds the shift (and frame-rate stretch) that best lines the Arabic file up with the German one,
@@ -283,12 +275,10 @@ function fixArabicLine(line) {
 function arabicBlock(text) {
   return text
     .replace(/<[^>]+>/g, "")
-    .split("
-")
+    .split("\n")
     .map(fixArabicLine)
     .filter(Boolean)
-    .join("
-");
+    .join("\n");
 }
 
 // Joins German cues that are one sentence cut in two (no end punctuation, tiny gap).
@@ -301,9 +291,7 @@ function mergeFragments(cues) {
       const b = plain(c.text).trim();
       const complete = /[.?!…؟»"'\])]$/.test(a);
       if (!complete && c.start - prev.end <= 400 && !/^[-–—\[(]/.test(b) && a.length + b.length <= 84) {
-        prev.text = `${prev.text.replace(/
-/g, " ")} ${c.text.replace(/
-/g, " ")}`;
+        prev.text = `${prev.text.replace(/\n/g, " ")} ${c.text.replace(/\n/g, " ")}`;
         prev.end = Math.max(prev.end, c.end);
         continue;
       }
@@ -389,9 +377,7 @@ function mergeDual(deText, arText) {
     end: d.end,
     // Applied font scaling modifications into the parent German elements here as well
     text: attached[i].length 
-      ? `<font size="5">${d.text}</font>
-${attached[i].join("
-")}` 
+      ? `<font size="5">${d.text}</font>\n${attached[i].join("\n")}` 
       : `<font size="5">${d.text}</font>`
   }));
   // Arabic cues that matched no German cue are kept, so no translation is lost.
@@ -525,3 +511,4 @@ module.exports = async (req, res) => {
     res.end("Upstream error");
   }
 };
+
