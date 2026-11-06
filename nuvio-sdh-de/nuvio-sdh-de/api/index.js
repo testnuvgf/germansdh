@@ -2,13 +2,13 @@
 // Offers DUAL subtitles: German SDH on top, Arabic translation underneath, merged into one track,
 // plus plain German SDH alternatives. Sources: OpenSubtitles.com (official API) and Wyzie Subs.
 
-const UA = "NuvioSdhDe v3.0.0";
+const UA = "NuvioSdhDe v3.1.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 
 // ---- Settings you may want to change -------------------------------------
 const ARABIC_SDH_ONLY = false;       // true = only use Arabic files flagged SDH (rare)
 const ARABIC_COLOR = "";             // e.g. "#FFEB3B" for yellow Arabic. Many players ignore colour tags.
-const ALLOW_NON_SDH_FALLBACK = false;// true = if NO German SDH exists anywhere, offer normal German instead
+const ALLOW_NON_SDH_FALLBACK = true; // true = if NO German SDH exists anywhere, offer normal German instead
 const DETECT_SDH_BY_NAME = true;     // also accept German files whose name says SDH/HoH
 const DUAL_OPTIONS = 3;              // how many dual (German+Arabic) choices to list
 const GERMAN_ONLY_OPTIONS = 2;       // how many plain German SDH choices to list
@@ -19,14 +19,14 @@ const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 const WYZIE_KEY = process.env.WYZIE_KEY || "";
 const WYZIE_BASE = process.env.WYZIE_BASE || "https://sub.wyzie.io";
 const SDH_NAME = /(^|[^a-z0-9])(sdh|hoh|hearing[ ._-]?impaired)([^a-z0-9]|$)/i;
-const CACHE_V = "5";
+const CACHE_V = "6";
 
 let token = null;
 let apiBase = process.env.OS_API_BASE || API_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "3.0.0",
+  version: "3.1.0",
   name: "German SDH + Arabic (dual)",
   description: "Best-rated German SDH subtitles with an Arabic translation underneath, from OpenSubtitles & Wyzie.",
   resources: ["subtitles"],
@@ -48,18 +48,22 @@ function osHeaders(extra = {}) {
 }
 
 async function login() {
+  if (!process.env.OS_API_KEY && (!process.env.OS_USERNAME || !process.env.OS_PASSWORD)) {
+    throw new Error("Missing OpenSubtitles credentials (OS_API_KEY or username/password)");
+  }
   const r = await fetch(`${apiBase}/login`, {
     method: "POST",
     headers: osHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ username: process.env.OS_USERNAME, password: process.env.OS_PASSWORD })
   });
-  if (!r.ok) throw new Error(`login failed: ${r.status}`);
+  if (!r.ok) throw new Error(`OpenSubtitles login failed: ${r.status}`);
   const j = await r.json();
   token = j.token;
   if (!process.env.OS_API_BASE && j.base_url) apiBase = `https://${j.base_url}/api/v1`;
 }
 
 async function searchOS(type, id, extra, lang, hearing) {
+  if (!process.env.OS_API_KEY && !process.env.OS_USERNAME) return [];
   const [imdb, season, episode] = id.split(":");
   const params = { hearing_impaired: hearing, languages: lang };
 
@@ -75,7 +79,10 @@ async function searchOS(type, id, extra, lang, hearing) {
 
   const qs = Object.keys(params).sort().map((k) => `${k}=${encodeURIComponent(params[k])}`).join("&");
   const r = await fetch(`${apiBase}/subtitles?${qs}`, { headers: osHeaders() });
-  if (!r.ok) return [];
+  if (!r.ok) {
+    console.error(`OS search error for ${lang}: ${r.status}`);
+    return [];
+  }
   const j = await r.json();
 
   return (j.data || [])
@@ -149,8 +156,8 @@ async function searchWyzie(type, id, lang) {
 async function searchAll(type, id, extra, lang, mode) {
   const hearing = mode === "sdh" ? "only" : "include";
   const [osResults, wyzieResults] = await Promise.all([
-    searchOS(type, id, extra, lang, hearing).catch(() => []),
-    searchWyzie(type, id, lang).catch(() => [])
+    searchOS(type, id, extra, lang, hearing).catch((e) => { console.error("OS search exception:", e); return []; }),
+    searchWyzie(type, id, lang).catch((e) => { console.error("Wyzie search exception:", e); return []; })
   ]);
   return [...osResults, ...wyzieResults];
 }
@@ -158,7 +165,7 @@ async function searchAll(type, id, extra, lang, mode) {
 const REF_RE = /^(os\d+|wz\d+_.+|\d+)$/;
 
 async function fetchSub(ref, lang) {
-  if (!REF_RE.test(ref)) throw new Error("bad ref");
+  if (!REF_RE.test(ref)) throw new Error(`Invalid subtitle reference format: ${ref}`);
 
   if (ref.startsWith("os")) {
     const fileId = ref.slice(2);
@@ -170,7 +177,6 @@ async function fetchSub(ref, lang) {
     const buf = Buffer.from(await r.arrayBuffer());
     return decodeSrtBuffer(buf);
   } else {
-    // Legacy fallback
     return downloadOS(ref);
   }
 }
@@ -186,12 +192,12 @@ async function downloadOS(fileId, retry = true) {
     token = null;
     return downloadOS(fileId, false);
   }
-  if (!r.ok) throw new Error(`download request failed: ${r.status}`);
+  if (!r.ok) throw new Error(`OpenSubtitles download request failed: ${r.status}`);
   const j = await r.json();
-  if (!j.link) throw new Error("no download link");
+  if (!j.link) throw new Error("OpenSubtitles returned no download link");
 
   const f = await fetch(j.link, { headers: { "User-Agent": UA } });
-  if (!f.ok) throw new Error(`file fetch failed: ${f.status}`);
+  if (!f.ok) throw new Error(`Subfile fetch failed: ${f.status}`);
   const buf = Buffer.from(await f.arrayBuffer());
   return decodeSrtBuffer(buf);
 }
@@ -248,6 +254,7 @@ function bestArabicFor(de, arList, fileTokens) {
 // ===== SRT parsing & formatting =============================================
 
 function parseSrt(text) {
+  if (!text || typeof text !== "string") return [];
   text = text.replace(/^﻿/, "").replace(/\r/g, "");
   const cues = [];
   for (const block of text.split(/\n\s*\n/)) {
@@ -257,95 +264,7 @@ function parseSrt(text) {
     const m = lines[idx].match(/(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)/);
     if (!m) continue;
     const ms = (h, mi, s, f) => ((+h * 60 + +mi) * 60 + +s) * 1000 + +String(f).padEnd(3, "0").slice(0, 3);
-    const body = lines.slice(idx + 1).join("\n").replace(/\{\\[^}]*\}/g, "").trim();
-    if (!body) continue;
-    cues.push({ start: ms(m[1], m[2], m[3], m[4]), end: ms(m[5], m[6], m[7], m[8]), text: body });
-  }
-  return cues.sort((a, b) => a.start - b.start);
-}
-
-function fmtTime(t) {
-  t = Math.max(0, Math.round(t));
-  const ms = t % 1000, s = Math.floor(t / 1000) % 60, m = Math.floor(t / 60000) % 60, h = Math.floor(t / 3600000);
-  const p = (n, w = 2) => String(n).padStart(w, "0");
-  return `${p(h)}:${p(m)}:${p(s)},${p(ms, 3)}`;
-}
-
-function toSrt(cues) {
-  return cues.map((c, i) => `${i + 1}\n${fmtTime(c.start)} --> ${fmtTime(c.end)}\n${c.text}\n`).join("\n");
-}
-
-const BIDI = /[‎‏‪-‮⁦-⁩]/g;
-const plain = (t) => t.replace(/<[^>]+>/g, "").replace(BIDI, "");
-
-function bestAlignment(de, ar) {
-  const identity = { r: 1, off: 0 };
-  if (!de.length || !ar.length) return identity;
-
-  const near = (arr, t) => {
-    let lo = 0, hi = arr.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (arr[mid] < t) lo = mid + 1; else hi = mid;
-    }
-    let v = arr[lo];
-    if (lo > 0 && Math.abs(arr[lo - 1] - t) < Math.abs(v - t)) v = arr[lo - 1];
-    return v;
-  };
-
-  const step = Math.max(1, Math.ceil(de.length / 600));
-  const sample = de.filter((_, i) => i % step === 0);
-  const ratios = [1, 25 / 23.976, 23.976 / 25, 24 / 23.976, 23.976 / 24, 25 / 24, 24 / 25];
-
-  let best = { r: 1, off: 0, score: -1 };
-  let base = 0;
-  for (const r of ratios) {
-    const scaled = ar.map((c) => c.start * r);
-    for (let off = -15000; off <= 15000; off += 250) {
-      let sc = 0;
-      for (const c of sample) {
-        const t = c.start - off;
-        if (Math.abs(near(scaled, t) - t) <= 700) sc++;
-      }
-      if (r === 1 && off === 0) base = sc;
-      if (sc > best.score) best = { r, off, score: sc };
-    }
-  }
-  if (!(best.score >= base * 1.15 && best.score >= sample.length * 0.15)) return identity;
-
-  const scaled = ar.map((c) => c.start * best.r);
-  const diffs = [];
-  for (const c of sample) {
-    const t = c.start - best.off;
-    const d = t - near(scaled, t);
-    if (Math.abs(d) <= 700) diffs.push(d);
-  }
-  diffs.sort((x, y) => x - y);
-  const fine = diffs.length ? diffs[diffs.length >> 1] : 0;
-  return { r: best.r, off: Math.round(best.off + fine) };
-}
-
-function fixArabicLine(line) {
-  let l = line.replace(BIDI, "").trim();
-  if (!l) return "";
-  const m = l.match(/^(-\s*)?([?؟!]+)\s*(.+)$/);
-  if (m) {
-    const endsWithMark = /[?؟!]$/.test(m[3]);
-    l = `${m[1] || ""}${m[3]}${endsWithMark ? "" : m[2]}`;
-  }
-  l = l.replace(/\?/g, "؟").replace(/(?<!\d),|,(?!\d)/g, "،");
-  const wrapped = `‏‫${l}‬‏`;
-  return ARABIC_COLOR ? `<font color="${ARABIC_COLOR}">${wrapped}</font>` : wrapped;
-}
-
-function mergeFragments(cues) {
-  const out = [];
-  for (const c of cues) {
-    const prev = out[out.length - 1];
-    if (prev) {
-      const a = plain(prev.text).trim();
-      const b = plain(c.text).trim();
-      const complete = /[.?!…؟»"'\])]$/.test(a);
+    const body = lines.slice(idx + 1).join("\n").replace(/\{\\[^}]*\}/g, "").trim(); if (!body) continue; cues.push({ start: ms(m[1], m[2], m[3], m[4]), end: ms(m[5], m[6], m[7], m[8]), text: body }); } return cues.sort((a, b) => a.start - b.start); }  function fmtTime(t) { t = Math.max(0, Math.round(t)); const ms = t \% 1000, s = Math.floor(t / 1000) \% 60, m = Math.floor(t / 60000) \% 60, h = Math.floor(t / 3600000); const p = (n, w = 2) => String(n).padStart(w, "0"); return `${p(h)}:${p(m)}:${p(s)},${p(ms, 3)}`; }  function toSrt(cues) { return cues.map((c, i) => `${i + 1}\n${fmtTime(c.start)} --> ${fmtTime(c.end)}\n${c.text}\n`).join("\n"); }  const BIDI = /[‎‏‪-‮⁦-⁩]/g; const plain = (t) => t.replace(/<[^>]+>/g, "").replace(BIDI, "");  function bestAlignment(de, ar) { const identity = { r: 1, off: 0 }; if (!de.length \vert{}\vert{} !ar.length) return identity;    const near = (arr, t) => { let lo = 0, hi = arr.length - 1; while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] < t) lo = mid + 1; else hi = mid; } let v = arr[lo]; if (lo > 0 && Math.abs(arr[lo - 1] - t) < Math.abs(v - t)) v = arr[lo - 1]; return v; };    const step = Math.max(1, Math.ceil(de.length / 600)); const sample = de.filter((_, i) => i \% step === 0); const ratios = [1, 25 / 23.976, 23.976 / 25, 24 / 23.976, 23.976 / 24, 25 / 24, 24 / 25];    let best = { r: 1, off: 0, score: -1 }; let base = 0; for (const r of ratios) { const scaled = ar.map((c) => c.start * r); for (let off = -15000; off <= 15000; off += 250) { let sc = 0; for (const c of sample) { const t = c.start - off; if (Math.abs(near(scaled, t) - t) <= 700) sc++; } if (r === 1 && off === 0) base = sc; if (sc > best.score) best = { r, off, score: sc }; } } if (!(best.score >= base * 1.15 && best.score >= sample.length * 0.15)) return identity;    const scaled = ar.map((c) => c.start * best.r); const diffs = []; for (const c of sample) { const t = c.start - best.off; const d = t - near(scaled, t); if (Math.abs(d) <= 700) diffs.push(d); } diffs.sort((x, y) => x - y); const fine = diffs.length ? diffs[diffs.length >> 1] : 0; return { r: best.r, off: Math.round(best.off + fine) }; }  function fixArabicLine(line) { let l = line.replace(BIDI, "").trim(); if (!l) return ""; const m = l.match(/^(-\s*)?([?؟!]+)\s*(.+)$/); if (m) { const endsWithMark = /[?؟!]$/.test(m[3]); l = `${m[1] \vert{}\vert{} ""}${m[3]}${endsWithMark ? "" : m[2]}`; } l = l.replace(/\?/g, "؟").replace(/(?<!\d),\vert{},(?!\d)/g, "،"); const wrapped = `‏‫${l}‬‏`; return ARABIC_COLOR ? `<font color="${ARABIC_COLOR}">${wrapped}</font>` : wrapped; }  function mergeFragments(cues) { const out = []; for (const c of cues) { const prev = out[out.length - 1]; if (prev) { const a = plain(prev.text).trim(); const b = plain(c.text).trim(); const complete = /[.?!…؟»"'\])]$/.test(a);
       if (!complete && c.start - prev.end <= 400 && !/^[-–—\[(]/.test(b) && a.length + b.length <= 84) {
         prev.text = `${prev.text.replace(/\n/g, " ")} ${c.text.replace(/\n/g, " ")}`;
         prev.end = Math.max(prev.end, c.end);
@@ -391,6 +310,8 @@ function mergeDual(deText, arText) {
   const de = mergeFragments(parseSrt(deText));
   const arRaw = parseSrt(arText);
   if (!de.length) return deText;
+  if (!ar.length) return germanOnly(deText);
+
   const al = bestAlignment(de, arRaw);
   const ar = arRaw
     .map((c) => ({
@@ -479,9 +400,9 @@ module.exports = async (req, res) => {
       const extra = Object.fromEntries(new URLSearchParams(extraRaw));
       let subtitles = [];
 
-      if (id.startsWith("tt") && (process.env.OS_API_KEY || WYZIE_KEY)) {
+      if (id.startsWith("tt")) {
         const fileTokens = tokens(extra.filename || "");
-        const [deAll, arAll] = await Promise.all([
+        let [deAll, arAll] = await Promise.all([
           searchAll(type, id, extra, "de", "sdh"),
           searchAll(type, id, extra, "ar", ARABIC_SDH_ONLY ? "sdh" : "any")
         ]);
@@ -493,7 +414,7 @@ module.exports = async (req, res) => {
         const de = rank(deAll, fileTokens);
         const ar = rank(arAll, fileTokens);
 
-        if (ar.length) {
+        if (ar.length && de.length) {
           de.slice(0, DUAL_OPTIONS).forEach((d, i) => {
             const a = bestArabicFor(d, ar, fileTokens);
             if (a) {
@@ -529,7 +450,7 @@ module.exports = async (req, res) => {
       }
       const [deText, arText] = await Promise.all([
         fetchSub(match[1], "de"),
-        fetchSub(match[2], "ar").catch((e) => { console.error(e); return null; })
+        fetchSub(match[2], "ar").catch((e) => { console.error("Arabic fetch failed:", e); return null; })
       ]);
       const resText = arText ? mergeDual(deText, arText) : germanOnly(deText);
       res.statusCode = 200;
@@ -540,27 +461,4 @@ module.exports = async (req, res) => {
 
     if (parts[0] === "dl" && parts[1]) {
       const ref = parts[1].replace(/(?:\.v\d+)?\.srt$/, "");
-      if (!REF_RE.test(ref)) {
-        res.statusCode = 400;
-        return res.end("Bad id");
-      }
-      const text = germanOnly(await fetchSub(ref, "de"));
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/x-subrip; charset=utf-8");
-      res.setHeader("Cache-Control", "public, s-maxage=604800, max-age=86400");
-      return res.end(text);
-    }
-
-    res.statusCode = 404;
-    res.end("Not found");
-  } catch (err) {
-    console.error(err);
-    if (parts[0] === "subtitles") {
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json; charset=utf-8");
-      return res.end(JSON.stringify({ subtitles: [] }));
-    }
-    res.statusCode = 502;
-    res.end("Upstream error");
-  }
-};
+      if (!REF_RE.test(
