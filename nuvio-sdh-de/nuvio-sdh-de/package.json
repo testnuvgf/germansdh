@@ -1,0 +1,12 @@
+{
+  "name": "nuvio-opensubtitles-sdh-de",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Stremio/Nuvio addon serving German SDH subtitles from OpenSubtitles",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
