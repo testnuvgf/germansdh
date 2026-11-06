@@ -115,8 +115,21 @@ module.exports = async (req, res) => {
     return res.end();
   }
 
-  const url = new URL(req.url, "http://localhost");
-  const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  // Work out the requested path. On Vercel the rewrite passes it as ?__p=...
+  // (raw, so "&" inside Stremio's extra segment survives); locally it is just the URL path.
+  const rawUrl = req.url || "/";
+  const qIndex = rawUrl.indexOf("?");
+  const rawPath = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
+  const rawQuery = qIndex === -1 ? "" : rawUrl.slice(qIndex + 1);
+  let pathString = rawPath;
+  if (rawQuery.startsWith("__p=")) pathString = "/" + rawQuery.slice(4);
+  const parts = pathString
+    .split("/")
+    .filter(Boolean)
+    .map((seg) => {
+      try { return decodeURIComponent(seg); } catch { return seg; }
+    });
+  if (parts[0] === "api") parts.shift();
 
   const secret = process.env.ADDON_SECRET;
   if (secret) {
@@ -167,7 +180,7 @@ module.exports = async (req, res) => {
     }
 
     res.statusCode = 404;
-    res.end("Not found");
+    res.end(`Not found (path seen: /${parts.join("/")}, secret ${secret ? "ON" : "OFF"})`);
   } catch (err) {
     console.error(err);
     if (parts[0] === "subtitles") return sendJson(res, 200, { subtitles: [] });
