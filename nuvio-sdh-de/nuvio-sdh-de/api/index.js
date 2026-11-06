@@ -4,6 +4,8 @@
 // Sources: the official OpenSubtitles.com REST API + Wyzie Subs (sub.wyzie.io) as a second source.
 //
 // Env vars: OS_API_KEY, OS_USERNAME, OS_PASSWORD (required)
+//           DEEPL_KEY (optional but recommended: better Arabic translation, free tier 500k chars/month)
+//           ARABIC_MODE=files (optional: use separate Arabic files instead of translating)
 //           WYZIE_KEY    (optional: enables Wyzie Subs as an extra source)
 //           ADDON_SECRET (optional: puts every route under /<secret>/)
 //           SYNC_OFFSET_MS (optional: shift all subtitles, in ms)
@@ -17,17 +19,20 @@ const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const ARABIC_SDH_ONLY = false;     // true = only use Arabic files flagged SDH (rare)
 const ARABIC_COLOR = process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour as German (looks like ONE block)
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
+// "translate" (default): Arabic = machine translation of the SAME German file -> identical timing, perfect sync.
+// "files": merge a separate human-made Arabic file (can drift against the German one).
+const ARABIC_MODE = process.env.ARABIC_MODE === "files" ? "files" : "translate";
 // Set env ALIGN_ARABIC=0 to use the Arabic file's own timing untouched.
 const ALIGN_ARABIC = process.env.ALIGN_ARABIC !== "0";
 const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
 const DUAL_OPTIONS = 6;            // how many dual (German+Arabic) choices to list
-const GERMAN_ONLY_OPTIONS = 3;     // how many plain German SDH choices to list
+const GERMAN_ONLY_OPTIONS = 2;     // how many plain German SDH choices to list
 const READ_MS_PER_CHAR = 55;       // minimum on-screen time per character (about 18 chars/second)
 const MIN_CUE_MS = 1500;           // no subtitle stays shorter than this (if the next one allows)
 const MAX_CUE_MS = 7000;
 const WYZIE_PENALTY = 10;          // small score penalty for Wyzie files (they carry no ratings)
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
-const CACHE_V = "5";               // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "6";               // bump to force players/CDN to re-fetch subtitle files
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -569,6 +574,94 @@ function mergeDual(deText, arText) {
   return finalize(out);
 }
 
+// ===== Machine translation (German -> Arabic) ===============================
+// DeepL if DEEPL_KEY is set (official, best quality), otherwise Google's free web endpoint.
+
+async function pool(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  }));
+  return out;
+}
+
+async function deeplChunk(chunk) {
+  const key = process.env.DEEPL_KEY;
+  const host = key.endsWith(":fx") ? "https://api-free.deepl.com" : "https://api.deepl.com";
+  const r = await fetch(`${host}/v2/translate`, {
+    method: "POST",
+    headers: { Authorization: `DeepL-Auth-Key ${key}`, "Content-Type": "application/json", "User-Agent": UA },
+    body: JSON.stringify({ text: chunk, source_lang: "DE", target_lang: "AR" }),
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!r.ok) throw new Error(`deepl failed: ${r.status}`);
+  const j = await r.json();
+  return (j.translations || []).map((t) => t.text);
+}
+
+async function googleRaw(lines) {
+  const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&sl=de&tl=ar&dt=t", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0" },
+    body: "q=" + encodeURIComponent(lines.join("\n")),
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!r.ok) throw new Error(`google translate failed: ${r.status}`);
+  const j = await r.json();
+  return (j[0] || []).map((seg) => seg[0] || "").join("").replace(/\n$/, "").split("\n");
+}
+
+async function googleChunk(chunk) {
+  const lines = await googleRaw(chunk);
+  if (lines.length === chunk.length) return lines;
+  // line count got mangled: translate this chunk one line at a time
+  return pool(chunk, 4, async (t) => (await googleRaw([t]))[0] || "");
+}
+
+// texts[i] -> Arabic text (or "" when it could not be translated)
+async function translateTexts(texts) {
+  const idx = texts.map((t, i) => (t ? i : -1)).filter((i) => i >= 0);
+  const chunks = [];
+  let cur = [], size = 0;
+  const maxItems = process.env.DEEPL_KEY ? 50 : 40;
+  for (const i of idx) {
+    if (cur.length && (cur.length >= maxItems || size + texts[i].length > 3500)) {
+      chunks.push(cur); cur = []; size = 0;
+    }
+    cur.push(i); size += texts[i].length;
+  }
+  if (cur.length) chunks.push(cur);
+
+  const run = process.env.DEEPL_KEY ? deeplChunk : googleChunk;
+  const res = await pool(chunks, 6, async (ids) => {
+    try { return await run(ids.map((i) => texts[i])); }
+    catch (e) { console.error(e); return []; }
+  });
+  const out = texts.map(() => "");
+  chunks.forEach((ids, c) => ids.forEach((i, k) => { out[i] = (res[c] && res[c][k]) || ""; }));
+  return out;
+}
+
+const trCache = new Map();
+
+// German SDH on top, its own Arabic translation underneath: same cue, same timing.
+async function translatedDual(deText) {
+  const de = mergeFragments(parseSrt(deText));
+  if (!de.length) return deText;
+  const src = de.map((c) => plain(c.text).replace(/\s+/g, " ").trim());
+  let tr;
+  try { tr = await translateTexts(src); } catch (e) { console.error(e); return germanOnly(deText); }
+  if (!tr.some(Boolean)) return germanOnly(deText);
+  return finalize(de.map((d, i) => {
+    const ar = tr[i] ? arabicBlock(tr[i]) : "";
+    return { start: d.start, end: d.end, text: ar ? `${germanLtr(d.text)}\n${ar}` : d.text };
+  }));
+}
+
 // ===== HTTP handler ==========================================================
 
 function sendJson(res, status, body, cache) {
@@ -655,16 +748,20 @@ module.exports = async (req, res) => {
         const safe = (p) => p.catch((e) => { console.error(e); return []; });
         const [deOs, arOs, deWy, arWy] = await Promise.all([
           safe(searchLang(type, id, extra, "de", "only", { ai_translated: "exclude", machine_translated: "exclude" })),
-          safe(searchLang(type, id, extra, "ar", ARABIC_SDH_ONLY ? "only" : "include")),
+          ARABIC_MODE === "files" ? safe(searchLang(type, id, extra, "ar", ARABIC_SDH_ONLY ? "only" : "include")) : Promise.resolve([]),
           safe(searchWyzie(type, id, "de", true)),
-          safe(searchWyzie(type, id, "ar", ARABIC_SDH_ONLY))
+          ARABIC_MODE === "files" ? safe(searchWyzie(type, id, "ar", ARABIC_SDH_ONLY)) : Promise.resolve([])
         ]);
         const de = rank([...deOs, ...deWy], fileTokens);
         const ar = rank([...arOs, ...arWy], fileTokens);
 
         // Dual choices: best German on top + best Arabic underneath first, then the other
         // top-German x top-Arabic combinations, so you can compare and keep the one that fits.
-        if (ar.length) {
+        if (ARABIC_MODE === "translate") {
+          de.slice(0, DUAL_OPTIONS).forEach((d, i) => {
+            subtitles.push({ id: `dual-tr-${i + 1}-${shortId(d.ref)}`, url: `${base}/tr/${d.ref}.v${CACHE_V}.srt`, lang: "ger" });
+          });
+        } else if (ar.length) {
           const combos = [];
           for (let i = 0; i < Math.min(3, de.length); i++)
             for (let j = 0; j < Math.min(3, ar.length); j++) combos.push({ i, j });
@@ -684,6 +781,20 @@ module.exports = async (req, res) => {
         });
       }
       return sendJson(res, 200, { subtitles }, "public, s-maxage=3600");
+    }
+
+    if (parts[0] === "tr" && parts[1]) {
+      const ref = parts[1].replace(/(?:\.v\d+)?\.srt$/, "");
+      if (!/^[\w-]+$/.test(ref)) {
+        res.statusCode = 400;
+        return res.end("Bad id");
+      }
+      if (!trCache.has(ref)) {
+        if (!token && !ref.startsWith("w")) await login();
+        trCache.set(ref, await translatedDual(await download(ref)));
+        if (trCache.size > 20) trCache.delete(trCache.keys().next().value);
+      }
+      return sendSrt(res, trCache.get(ref));
     }
 
     if (parts[0] === "dual" && parts[1]) {
