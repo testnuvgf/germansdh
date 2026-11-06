@@ -1,4 +1,3 @@
-
- {
-  "rewrites": [{ "source": "/(.*)", "destination": "/api?__p=$1" }]
+{
+  "functions": { "api/index.js": { "maxDuration": 60 } }
 }
