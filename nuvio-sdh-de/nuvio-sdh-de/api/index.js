@@ -15,7 +15,9 @@ const WYZIE_DEFAULT = "https://sub.wyzie.io";
 
 // ---- Settings you may want to change -------------------------------------
 const ARABIC_SDH_ONLY = false;     // true = only use Arabic files flagged SDH (rare)
-const ARABIC_COLOR = "#FFEB3B";    // colour of the Arabic lines ("" = no colour tag)
+const ARABIC_COLOR = process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour as German (looks like ONE block)
+const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
+const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
 const DUAL_OPTIONS = 3;            // how many dual (German+Arabic) choices to list
 const GERMAN_ONLY_OPTIONS = 2;     // how many plain German SDH choices to list
 const READ_MS_PER_CHAR = 55;       // minimum on-screen time per character (about 18 chars/second)
@@ -47,6 +49,9 @@ const MANIFEST = {
 //   digits        -> OpenSubtitles file_id
 //   "w" + base64url(url) -> a Wyzie download URL
 
+const crypto = require("crypto");
+const shortId = (ref) => crypto.createHash("sha1").update(ref).digest("hex").slice(0, 10);
+
 const WYZIE_HOST = /(^|\.)wyzie\.(io|ru)$/i;
 
 function wyzieRef(url) {
@@ -71,16 +76,37 @@ function osHeaders(extra = {}) {
   };
 }
 
-async function login() {
-  const r = await fetch(`${apiBase}/login`, {
-    method: "POST",
-    headers: osHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ username: process.env.OS_USERNAME, password: process.env.OS_PASSWORD })
-  });
-  if (!r.ok) throw new Error(`login failed: ${r.status}`);
-  const j = await r.json();
-  token = j.token;
-  if (!process.env.OS_API_BASE && j.base_url) apiBase = `https://${j.base_url}/api/v1`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Only ONE login runs at a time; everybody else waits for it. OpenSubtitles allows ~1 login/second,
+// so parallel logins (German + Arabic download at once) were answered with 429.
+let loginPromise = null;
+function login() {
+  if (!loginPromise) {
+    loginPromise = doLogin().finally(() => { loginPromise = null; });
+  }
+  return loginPromise;
+}
+
+async function doLogin() {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const r = await fetch(`${apiBase}/login`, {
+      method: "POST",
+      headers: osHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ username: process.env.OS_USERNAME, password: process.env.OS_PASSWORD })
+    });
+    if (r.status === 429) {
+      const wait = Number(r.headers.get("retry-after")) || 0;
+      await sleep(Math.min(5000, Math.max(1200, wait * 1000)) + attempt * 500);
+      continue;
+    }
+    if (!r.ok) throw new Error(`login failed: ${r.status}`);
+    const j = await r.json();
+    token = j.token;
+    if (!process.env.OS_API_BASE && j.base_url) apiBase = `https://${j.base_url}/api/v1`;
+    return;
+  }
+  throw new Error("login failed: 429 (rate limited)");
 }
 
 // Returns every OpenSubtitles candidate for one language with the fields we rank on.
@@ -137,10 +163,16 @@ async function searchWyzie(type, id, lang, hearing) {
     params.episode = episode;
   }
   const qs = Object.keys(params).map((k) => `${k}=${encodeURIComponent(params[k])}`).join("&");
-  const r = await fetch(`${wyzieBase}/search?${qs}`, {
+  const call = (q) => fetch(`${wyzieBase}/search?${q}`, {
     headers: { "User-Agent": UA, Accept: "application/json" },
     signal: AbortSignal.timeout(8000)
   });
+  let r = await call(qs);
+  if (r.status === 400) {
+    // some deployments reject source=all; retry with the default source
+    delete params.source;
+    r = await call(Object.keys(params).map((k) => `${k}=${encodeURIComponent(params[k])}`).join("&"));
+  }
   if (!r.ok) throw new Error(`wyzie search failed (${lang}): ${r.status}`);
   const list = await r.json();
   if (!Array.isArray(list)) return [];
@@ -183,6 +215,10 @@ async function downloadOs(fileId, retry = true) {
   });
   if (r.status === 401 && retry) {
     token = null;
+    return downloadOs(fileId, false);
+  }
+  if (r.status === 429 && retry) {
+    await sleep(1500);
     return downloadOs(fileId, false);
   }
   if (!r.ok) throw new Error(`download request failed: ${r.status}`);
@@ -287,10 +323,19 @@ function toSrt(cues) {
 const BIDI = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
 const plain = (t) => t.replace(/<[^>]+>/g, "").replace(BIDI, "");
 
-// Finds the shift (and frame-rate stretch) that best lines the Arabic file up with the German one,
-// then refines the shift to the millisecond.
+// Cues that only describe sounds ([Musik], (lacht), ♪ ...) have no Arabic twin, so they must not
+// take part in the alignment.
+const isSoundCue = (t) => {
+  const p = plain(t).trim();
+  return /^[\[(♪#].*[\])♪#]?$/s.test(p) && /^[\[(♪]/.test(p) && /[\])♪]$/.test(p);
+};
+
+// Lines the Arabic file up with the German one:
+//  1. global frame-rate stretch + offset (coarse search over +-60 s, then 50 ms fine search),
+//  2. local drift correction per ~8 minute window (handles different cuts / ad breaks).
+// Returns { map(t) } that converts an Arabic timestamp to German time.
 function bestAlignment(de, ar) {
-  const identity = { r: 1, off: 0 };
+  const identity = { map: (t) => t };
   if (!de.length || !ar.length) return identity;
 
   const near = (arr, t) => {
@@ -304,37 +349,85 @@ function bestAlignment(de, ar) {
     return v;
   };
 
-  const step = Math.max(1, Math.ceil(de.length / 600));
-  const sample = de.filter((_, i) => i % step === 0);
+  const ref = de.filter((c) => !isSoundCue(c.text));
+  const base = ref.length >= 10 ? ref : de;
+  const step = Math.max(1, Math.ceil(base.length / 600));
+  const sample = base.filter((_, i) => i % step === 0);
   const ratios = [1, 25 / 23.976, 23.976 / 25, 24 / 23.976, 23.976 / 24, 25 / 24, 24 / 25];
+  const count = (scaled, off, tol) => {
+    let sc = 0;
+    for (const c of sample) {
+      const t = c.start - off;
+      if (Math.abs(near(scaled, t) - t) <= tol) sc++;
+    }
+    return sc;
+  };
 
+  // coarse
   let best = { r: 1, off: 0, score: -1 };
-  let base = 0;
+  let zero = 0;
   for (const r of ratios) {
     const scaled = ar.map((c) => c.start * r);
-    for (let off = -15000; off <= 15000; off += 250) {
-      let sc = 0;
-      for (const c of sample) {
-        const t = c.start - off;
-        if (Math.abs(near(scaled, t) - t) <= 700) sc++;
-      }
-      if (r === 1 && off === 0) base = sc;
+    for (let off = -60000; off <= 60000; off += 500) {
+      const sc = count(scaled, off, 800);
+      if (r === 1 && off === 0) zero = sc;
       if (sc > best.score) best = { r, off, score: sc };
     }
   }
-  if (!(best.score >= base * 1.15 && best.score >= sample.length * 0.15)) return identity;
+  if (!(best.score >= zero * 1.15 && best.score >= sample.length * 0.15)) {
+    if (zero < sample.length * 0.15) return identity;
+    best = { r: 1, off: 0, score: zero };
+  }
 
-  // Millisecond refinement: median remaining difference of matched cue starts.
-  const scaled = ar.map((c) => c.start * best.r);
+  // fine
+  const scaledBest = ar.map((c) => c.start * best.r);
+  let fineBest = { off: best.off, score: -1 };
+  for (let off = best.off - 600; off <= best.off + 600; off += 50) {
+    const sc = count(scaledBest, off, 350);
+    if (sc > fineBest.score) fineBest = { off, score: sc };
+  }
   const diffs = [];
   for (const c of sample) {
-    const t = c.start - best.off;
-    const d = t - near(scaled, t);
-    if (Math.abs(d) <= 700) diffs.push(d);
+    const t = c.start - fineBest.off;
+    const d = t - near(scaledBest, t);
+    if (Math.abs(d) <= 500) diffs.push(d);
   }
   diffs.sort((x, y) => x - y);
-  const fine = diffs.length ? diffs[diffs.length >> 1] : 0;
-  return { r: best.r, off: Math.round(best.off + fine) };
+  const off0 = Math.round(fineBest.off + (diffs.length ? diffs[diffs.length >> 1] : 0));
+  const map0 = (t) => t * best.r + off0;
+
+  // local drift per window
+  const aligned = ar.map((c) => map0(c.start));
+  const WIN = 8 * 60 * 1000;
+  const groups = new Map();
+  for (const c of base) {
+    const d = c.start - near(aligned, c.start);
+    if (Math.abs(d) > 2000) continue;
+    const k = Math.floor(c.start / WIN);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push({ t: c.start, d });
+  }
+  const pts = [];
+  for (const g of groups.values()) {
+    if (g.length < 6) continue;
+    const ds = g.map((x) => x.d).sort((x, y) => x - y);
+    pts.push({ t: g.reduce((a, x) => a + x.t, 0) / g.length, d: ds[ds.length >> 1] });
+  }
+  pts.sort((x, y) => x.t - y.t);
+  if (!pts.length) return { map: map0 };
+
+  const drift = (t) => {
+    if (t <= pts[0].t) return pts[0].d;
+    if (t >= pts[pts.length - 1].t) return pts[pts.length - 1].d;
+    for (let i = 1; i < pts.length; i++) {
+      if (t <= pts[i].t) {
+        const p = pts[i - 1], q = pts[i];
+        return p.d + ((q.d - p.d) * (t - p.t)) / (q.t - p.t);
+      }
+    }
+    return 0;
+  };
+  return { map: (t) => { const m = map0(t); return m + drift(m); } };
 }
 
 // Arabic needs explicit right-to-left handling, otherwise "?" "." "!" jump to the wrong end of the line.
@@ -350,28 +443,36 @@ function fixArabicLine(line) {
   l = l.replace(/\?/g, "\u061F").replace(/(?<!\d),|,(?!\d)/g, "\u060C");
   // RLM + RLE ... PDF + RLM: whole line is right-to-left and trailing punctuation stays at the left end.
   const wrapped = `\u200F\u202B${l}\u202C\u200F`;
-  return ARABIC_COLOR ? `<font color="${ARABIC_COLOR}">${wrapped}</font>` : wrapped;
+  return styled(wrapped, ARABIC_COLOR);
+}
+
+// Short two-line cues read better as one line: it makes each language a single compact unit.
+function compactLines(lines) {
+  const ok = lines.length > 1 && !lines.some((l) => /^\s*[-\u2013\u2014]/.test(plain(l))) &&
+    lines.reduce((n, l) => n + plain(l).length, 0) <= COMPACT_MAX;
+  return ok ? [lines.map((l) => l.trim()).join(" ")] : lines;
+}
+
+function styled(text, color) {
+  let out = text;
+  if (color || FONT_FACE) {
+    const attrs = `${FONT_FACE ? ` face="${FONT_FACE}"` : ""}${color ? ` color="${color}"` : ""}`;
+    out = `<font${attrs}>${out}</font>`;
+  }
+  return out;
 }
 
 function arabicBlock(text) {
-  return text
-    .replace(/<[^>]+>/g, "")
-    .split("\n")
-    .map(fixArabicLine)
-    .filter(Boolean)
-    .join("\n");
+  const lines = text.replace(/<[^>]+>/g, "").split("\n").map((l) => l.trim()).filter(Boolean);
+  return compactLines(lines).map(fixArabicLine).filter(Boolean).join("\n");
 }
 
 // Forces each German line to be laid out left-to-right (LRM + LRE ... PDF + LRM), so a player
 // that sees Arabic in the same cue does not flip the whole block into right-to-left order.
-// (SRT has no CSS, so Unicode embedding controls are the portable way to do "direction: ltr".)
 function germanLtr(text) {
-  return text
-    .split("\n")
-    .map((l) => {
-      const t = l.replace(BIDI, "");
-      return t.trim() ? `\u200E\u202A${t}\u202C\u200E` : t;
-    })
+  const lines = compactLines(text.split("\n").filter((l) => l.trim()));
+  return lines
+    .map((l) => styled(`\u200E\u202A${l.replace(BIDI, "")}\u202C\u200E`, ""))
     .join("\n");
 }
 
@@ -433,8 +534,8 @@ function mergeDual(deText, arText) {
   const al = bestAlignment(de, arRaw);
   const ar = arRaw
     .map((c) => ({
-      start: Math.round(c.start * al.r + al.off),
-      end: Math.round(c.end * al.r + al.off),
+      start: Math.round(al.map(c.start)),
+      end: Math.round(al.map(c.end)),
       text: arabicBlock(c.text)
     }))
     .filter((c) => c.text);
@@ -523,6 +624,23 @@ module.exports = async (req, res) => {
       return sendJson(res, 200, MANIFEST, "public, max-age=3600");
     }
 
+    // /debug/<type>/<imdb[:season:episode]>  -> shows what each source returned (no keys shown)
+    if (parts[0] === "debug" && parts.length >= 3) {
+      const type = parts[1];
+      const id = parts[2];
+      const run = async (name, fn) => {
+        try { const l = await fn(); return { name, count: l.length, sample: l.slice(0, 2).map((c) => c.release) }; }
+        catch (e) { return { name, error: String(e.message || e) }; }
+      };
+      const out = await Promise.all([
+        run("os-de-sdh", () => searchLang(type, id, {}, "de", "only", { ai_translated: "exclude", machine_translated: "exclude" })),
+        run("os-ar", () => searchLang(type, id, {}, "ar", ARABIC_SDH_ONLY ? "only" : "include")),
+        run("wyzie-de-sdh", () => searchWyzie(type, id, "de", true)),
+        run("wyzie-ar", () => searchWyzie(type, id, "ar", ARABIC_SDH_ONLY))
+      ]);
+      return sendJson(res, 200, { wyzieKeySet: !!process.env.WYZIE_KEY, osKeySet: !!process.env.OS_API_KEY, results: out });
+    }
+
     if (parts[0] === "subtitles" && parts.length >= 3) {
       const type = parts[1];
       const id = parts[2].replace(/\.json$/, "");
@@ -548,7 +666,7 @@ module.exports = async (req, res) => {
             const a = bestArabicFor(d, ar, fileTokens);
             if (a) {
               subtitles.push({
-                id: `dual-${i + 1}-${d.ref.slice(0, 12)}-${a.ref.slice(0, 12)}`,
+                id: `dual-${i + 1}-${shortId(d.ref)}-${shortId(a.ref)}`,
                 url: `${base}/dual/${d.ref}~${a.ref}.v${CACHE_V}.srt`,
                 lang: "ger"
               });
@@ -557,7 +675,7 @@ module.exports = async (req, res) => {
         }
         // Plain German SDH alternatives, in case a dual one is off for your video.
         de.slice(0, GERMAN_ONLY_OPTIONS).forEach((d, i) => {
-          subtitles.push({ id: `de-sdh-${i + 1}-${d.ref.slice(0, 12)}`, url: `${base}/dl/${d.ref}.v${CACHE_V}.srt`, lang: "ger" });
+          subtitles.push({ id: `de-sdh-${i + 1}-${shortId(d.ref)}`, url: `${base}/dl/${d.ref}.v${CACHE_V}.srt`, lang: "ger" });
         });
       }
       return sendJson(res, 200, { subtitles }, "public, s-maxage=3600");
@@ -569,6 +687,7 @@ module.exports = async (req, res) => {
         res.statusCode = 400;
         return res.end("Bad id");
       }
+      if (!token) await login();
       const [deText, arText] = await Promise.all([
         download(m[1]),
         download(m[2]).catch((e) => { console.error(e); return null; })
