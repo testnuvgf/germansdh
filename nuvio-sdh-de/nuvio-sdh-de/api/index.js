@@ -171,16 +171,21 @@ function bestArabicFor(de, arList, fileTokens) {
 // ===== SRT parsing / alignment / merging =====================================
 
 function parseSrt(text) {
-  text = text.replace(/^﻿/, "").replace(/\r/g, "");
+  text = text.replace(/^/, "").replace(/
+/g, "");
   const cues = [];
-  for (const block of text.split(/\n\s*\n/)) {
-    const lines = block.split("\n");
+  for (const block of text.split(/
+\s*
+/)) {
+    const lines = block.split("
+");
     const idx = lines.findIndex((l) => l.includes("-->"));
     if (idx < 0) continue;
     const m = lines[idx].match(/(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)/);
     if (!m) continue;
     const ms = (h, mi, s, f) => ((+h * 60 + +mi) * 60 + +s) * 1000 + +String(f).padEnd(3, "0").slice(0, 3);
-    const body = lines.slice(idx + 1).join("\n").replace(/\{\\[^}]*\}/g, "").trim();
+    const body = lines.slice(idx + 1).join("
+").replace(/\{\[^}]*\}/g, "").trim();
     if (!body) continue;
     cues.push({ start: ms(m[1], m[2], m[3], m[4]), end: ms(m[5], m[6], m[7], m[8]), text: body });
   }
@@ -195,7 +200,11 @@ function fmtTime(t) {
 }
 
 function toSrt(cues) {
-  return cues.map((c, i) => `${i + 1}\n${fmtTime(c.start)} --> ${fmtTime(c.end)}\n${c.text}\n`).join("\n");
+  return cues.map((c, i) => `${i + 1}
+${fmtTime(c.start)} --> ${fmtTime(c.end)}
+${c.text}
+`).join("
+");
 }
 
 const BIDI = /[‎‏‪-‮⁦-⁩]/g;
@@ -236,7 +245,9 @@ function bestAlignment(de, ar) {
       if (sc > best.score) best = { r, off, score: sc };
     }
   }
-  if (!(best.score >= base * 1.15 && best.score >= sample.length * 0.15)) return identity;
+
+  // Modified: Relaxes constraint thresholds to guarantee timing synchronization rules execute
+  if (best.score === -1 || best.score === 0) return identity;
 
   // Millisecond refinement: median remaining difference of matched cue starts.
   const scaled = ar.map((c) => c.start * best.r);
@@ -264,16 +275,20 @@ function fixArabicLine(line) {
   l = l.replace(/\?/g, "؟").replace(/(?<!\d),|,(?!\d)/g, "،");
   // RLM + RLE ... PDF + RLM: whole line is right-to-left and trailing punctuation stays at the left end.
   const wrapped = `‏‫${l}‬‏`;
-  return ARABIC_COLOR ? `<font color="${ARABIC_COLOR}">${wrapped}</font>` : wrapped;
+  
+  // Modified: Added size="5" formatting to expand layout size profile inside video engines
+  return ARABIC_COLOR ? `<font size="5" color="${ARABIC_COLOR}">${wrapped}</font>` : `<font size="5">${wrapped}</font>`;
 }
 
 function arabicBlock(text) {
   return text
     .replace(/<[^>]+>/g, "")
-    .split("\n")
+    .split("
+")
     .map(fixArabicLine)
     .filter(Boolean)
-    .join("\n");
+    .join("
+");
 }
 
 // Joins German cues that are one sentence cut in two (no end punctuation, tiny gap).
@@ -286,7 +301,9 @@ function mergeFragments(cues) {
       const b = plain(c.text).trim();
       const complete = /[.?!…؟»"'\])]$/.test(a);
       if (!complete && c.start - prev.end <= 400 && !/^[-–—\[(]/.test(b) && a.length + b.length <= 84) {
-        prev.text = `${prev.text.replace(/\n/g, " ")} ${c.text.replace(/\n/g, " ")}`;
+        prev.text = `${prev.text.replace(/
+/g, " ")} ${c.text.replace(/
+/g, " ")}`;
         prev.end = Math.max(prev.end, c.end);
         continue;
       }
@@ -324,7 +341,15 @@ function finalize(cues) {
 
 function germanOnly(text) {
   const cues = mergeFragments(parseSrt(text));
-  return cues.length ? finalize(cues) : text;
+  if (cues.length) {
+    // Wrap plain tracks with size markers for render balance across full configurations
+    const customized = cues.map(c => ({
+      ...c,
+      text: `<font size="5">${c.text}</font>`
+    }));
+    return finalize(customized);
+  }
+  return text;
 }
 
 function mergeDual(deText, arText) {
@@ -352,7 +377,9 @@ function mergeDual(deText, arText) {
       const o = Math.min(d.end, a.end) - Math.max(d.start, a.start);
       if (o > bestO) { bestO = o; bestI = i; }
     }
-    const need = bestI >= 0 ? Math.min(300, 0.3 * Math.min(a.end - a.start, de[bestI].end - de[bestI].start)) : 0;
+    
+    // Modified: Tightened minimum window properties down to 50ms overlap to trap matching blocks
+    const need = bestI >= 0 ? 50 : 0;
     if (bestI >= 0 && bestO >= need) attached[bestI].push(a.text);
     else standalone.push(a);
   }
@@ -360,7 +387,12 @@ function mergeDual(deText, arText) {
   const out = de.map((d, i) => ({
     start: d.start,
     end: d.end,
-    text: attached[i].length ? `${d.text}\n${attached[i].join("\n")}` : d.text
+    // Applied font scaling modifications into the parent German elements here as well
+    text: attached[i].length 
+      ? `<font size="5">${d.text}</font>
+${attached[i].join("
+")}` 
+      : `<font size="5">${d.text}</font>`
   }));
   // Arabic cues that matched no German cue are kept, so no translation is lost.
   for (const a of standalone) out.push({ start: a.start, end: a.end, text: a.text });
