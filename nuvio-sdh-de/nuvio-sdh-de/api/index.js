@@ -1,4 +1,4 @@
-// Stremio-protocol subtitle addon (works with Nuvio).
+/ Stremio-protocol subtitle addon (works with Nuvio).
 // Offers DUAL subtitles: German SDH on top, Arabic translation underneath, merged into one track,
 // plus plain German SDH alternatives. Source: the official OpenSubtitles.com REST API.
 //
@@ -154,6 +154,12 @@ function score(c, fileTokens) {
   return s;
 }
 
+function rank(list, fileTokens) {
+  return list
+    .map((c) => ({ ...c, score: score(c, fileTokens) }))
+    .sort((a, b) => b.score - a.score);
+}
+
 // Best Arabic file for a given German pick: good on its own AND from the same release.
 function bestArabicFor(de, arList, fileTokens) {
   const deTokens = tokens(de.release);
@@ -230,8 +236,8 @@ function bestAlignment(de, ar) {
       if (sc > best.score) best = { r, off, score: sc };
     }
   }
-  
-  // MODIFIED: Relaxes constraints to ensure the best synchronization match is used
+
+  // Modified: Relaxes constraint thresholds to guarantee timing synchronization rules execute
   if (best.score === -1 || best.score === 0) return identity;
 
   // Millisecond refinement: median remaining difference of matched cue starts.
@@ -251,7 +257,233 @@ function bestAlignment(de, ar) {
 function fixArabicLine(line) {
   let l = line.replace(BIDI, "").trim();
   if (!l) return "";
-  // A question/exclamation mark typed at the logical START of the line belongs at the end.
-  const m = l.match(/^(-\s*)?([?؟!]+)\s*(.+)$/);
-  if (m) {
-    const endsWithMark = /[?؟!]$/.test(m[3]);
+Utilisez le code avec précaution.
+// A question/exclamation mark typed at the logical START of the line belongs at the end.
+const m = l.match(/^(-\s*)?([?؟!]+)\s*(.+)$/);
+if (m) {
+const endsWithMark = /[?؟!]$/.test(m[3]);
+l = ${m[1] || ""}${m[3]}${endsWithMark ? "" : m[2]};
+}
+l = l.replace(/?/g, "؟").replace(/(?<!\d),|,(?!\d)/g, "،");
+// RLM + RLE ... PDF + RLM: whole line is right-to-left and trailing punctuation stays at the left end.
+const wrapped = ‏‫${l}‬‏;
+// Modified: Added size="5" formatting to expand layout size profile inside video engines
+return ARABIC_COLOR ? <font size="5" color="${ARABIC_COLOR}">${wrapped}</font> : <font size="5">${wrapped}</font>;
+}
+function arabicBlock(text) {
+return text
+.replace(/<[^>]+>/g, "")
+.split("\n")
+.map(fixArabicLine)
+.filter(Boolean)
+.join("\n");
+}
+// Joins German cues that are one sentence cut in two (no end punctuation, tiny gap).
+function mergeFragments(cues) {
+const out = [];
+for (const c of cues) {
+const prev = out[out.length - 1];
+if (prev) {
+const a = plain(prev.text).trim();
+const b = plain(c.text).trim();
+const complete = /[.?!…؟»"'])]$/.test(a);
+if (!complete && c.start - prev.end <= 400 && !/^[-–—[(]/.test(b) && a.length + b.length <= 84) {
+prev.text = ${prev.text.replace(/\n/g, " ")} ${c.text.replace(/\n/g, " ")};
+prev.end = Math.max(prev.end, c.end);
+continue;
+}
+}
+out.push({ ...c });
+}
+return out;
+}
+// Gives every cue enough time to be read (never shortens, never runs into the next cue).
+function fixDurations(cues) {
+for (let i = 0; i < cues.length; i++) {
+const c = cues[i];
+const next = cues[i + 1];
+const chars = plain(c.text).replace(/\s+/g, " ").trim().length;
+const want = Math.min(MAX_CUE_MS, Math.max(MIN_CUE_MS, chars * READ_MS_PER_CHAR));
+let end = Math.max(c.end, c.start + want);
+if (next) end = Math.min(end, Math.max(c.end, next.start - 60));
+c.end = end;
+}
+return cues;
+}
+function finalize(cues) {
+cues.sort((a, b) => a.start - b.start);
+fixDurations(cues);
+if (SYNC_OFFSET_MS) {
+for (const c of cues) {
+c.start += SYNC_OFFSET_MS;
+c.end += SYNC_OFFSET_MS;
+}
+}
+return toSrt(cues);
+}
+function germanOnly(text) {
+const cues = mergeFragments(parseSrt(text));
+if (cues.length) {
+// Wrap plain tracks with size markers for render balance across full configurations
+const customized = cues.map(c => ({
+...c,
+text: <font size="5">${c.text}</font>
+}));
+return finalize(customized);
+}
+return text;
+}
+function mergeDual(deText, arText) {
+const de = mergeFragments(parseSrt(deText));
+const arRaw = parseSrt(arText);
+if (!de.length) return deText;
+const al = bestAlignment(de, arRaw);
+const ar = arRaw
+.map((c) => ({
+start: Math.round(c.start * al.r + al.off),
+end: Math.round(c.end * al.r + al.off),
+text: arabicBlock(c.text)
+}))
+.filter((c) => c.text);
+// Each Arabic cue is attached ONCE, to the German cue it overlaps most.
+const attached = de.map(() => []);
+const standalone = [];
+for (const a of ar) {
+let bestI = -1, bestO = 0;
+for (let i = 0; i < de.length; i++) {
+const d = de[i];
+if (d.start > a.end) break;
+if (d.end < a.start) continue;
+const o = Math.min(d.end, a.end) - Math.max(d.start, a.start);
+if (o > bestO) { bestO = o; bestI = i; }
+}
+// Modified: Tightened minimum window properties down to 50ms overlap to trap matching blocks
+const need = bestI >= 0 ? 50 : 0;
+if (bestI >= 0 && bestO >= need) attached[bestI].push(a.text);
+else standalone.push(a);
+}
+const out = de.map((d, i) => ({
+start: d.start,
+end: d.end,
+// Applied font scaling modifications into the parent German elements here as well
+text: attached[i].length
+? <font size="5">${d.text}</font>\n${attached[i].join("\n")}
+: <font size="5">${d.text}</font>
+}));
+// Arabic cues that matched no German cue are kept, so no translation is lost.
+for (const a of standalone) out.push({ start: a.start, end: a.end, text: a.text });
+return finalize(out);
+}
+// ===== HTTP handler ==========================================================
+function sendJson(res, status, body, cache) {
+res.statusCode = status;
+res.setHeader("Content-Type", "application/json; charset=utf-8");
+if (cache) res.setHeader("Cache-Control", cache);
+res.end(JSON.stringify(body));
+}
+function sendSrt(res, text) {
+res.statusCode = 200;
+res.setHeader("Content-Type", "application/x-subrip; charset=utf-8");
+// Cache hard: each real download counts against the daily quota.
+res.setHeader("Cache-Control", "public, s-maxage=604800, max-age=86400");
+res.end(text);
+}
+module.exports = async (req, res) => {
+res.setHeader("Access-Control-Allow-Origin", "");
+res.setHeader("Access-Control-Allow-Headers", "");
+if (req.method === "OPTIONS") {
+res.statusCode = 204;
+return res.end();
+}
+// On Vercel the rewrite passes the path as ?__p=... (maybe with %2F); locally it is the URL path.
+const rawUrl = req.url || "/";
+const qIndex = rawUrl.indexOf("?");
+const rawPath = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
+const rawQuery = qIndex === -1 ? "" : rawUrl.slice(qIndex + 1);
+let pathString = rawPath;
+if (rawQuery.startsWith("__p=")) pathString = "/" + rawQuery.slice(4).replace(/%2F/gi, "/");
+const parts = pathString
+.split("/")
+.filter(Boolean)
+.map((seg) => {
+try { return decodeURIComponent(seg); } catch { return seg; }
+});
+if (parts[0] === "api") parts.shift();
+const secret = process.env.ADDON_SECRET;
+if (secret) {
+if (parts[0] !== secret) {
+res.statusCode = 404;
+return res.end("Not found");
+}
+parts.shift();
+}
+const proto = req.headers["x-forwarded-proto"] || "http";
+const base = ${proto}://${req.headers.host}${secret ? "/" + encodeURIComponent(secret) : ""};
+try {
+if (parts[0] === "manifest.json") {
+return sendJson(res, 200, MANIFEST, "public, max-age=3600");
+}
+if (parts[0] === "subtitles" && parts.length >= 3) {
+const type = parts[1];
+const id = parts[2].replace(/.json$/, "");
+const extraRaw = (parts[3] || "").replace(/.json$/, "");
+const extra = Object.fromEntries(new URLSearchParams(extraRaw));
+let subtitles = [];
+if (id.startsWith("tt") && process.env.OS_API_KEY) {
+const fileTokens = tokens(extra.filename || "");
+const safe = (p) => p.catch((e) => { console.error(e); return []; });
+const [deAll, arAll] = await Promise.all([
+safe(searchLang(type, id, extra, "de", "only", { ai_translated: "exclude", machine_translated: "exclude" })),
+safe(searchLang(type, id, extra, "ar", ARABIC_SDH_ONLY ? "only" : "include"))
+]);
+const de = rank(deAll, fileTokens);
+const ar = rank(arAll, fileTokens);
+// Dual choices: best German files, each paired with the best-matching Arabic file.
+if (ar.length) {
+de.slice(0, DUAL_OPTIONS).forEach((d, i) => {
+const a = bestArabicFor(d, ar, fileTokens);
+if (a) {
+subtitles.push({
+id: dual-${i + 1}-${d.fileId}-${a.fileId},
+url: ${base}/dual/${d.fileId}-${a.fileId}.v${CACHE_V}.srt,
+lang: "ger"
+});
+}
+});
+}
+// Plain German SDH alternatives, in case a dual one is off for your video.
+de.slice(0, GERMAN_ONLY_OPTIONS).forEach((d, i) => {
+subtitles.push({ id: de-sdh-${i + 1}-${d.fileId}, url: ${base}/dl/${d.fileId}.v${CACHE_V}.srt, lang: "ger" });
+});
+}
+return sendJson(res, 200, { subtitles }, "public, s-maxage=3600");
+}
+if (parts[0] === "dual" && parts[1]) {
+const m = parts[1].match(/^(\d+)-(\d+)(?:.v\d+)?.srt$/);
+if (!m) {
+res.statusCode = 400;
+return res.end("Bad id");
+}
+const [deText, arText] = await Promise.all([
+download(m[1]),
+download(m[2]).catch((e) => { console.error(e); return null; })
+]);
+return sendSrt(res, arText ? mergeDual(deText, arText) : germanOnly(deText));
+}
+if (parts[0] === "dl" && parts[1]) {
+const fileId = parts[1].replace(/(?:.v\d+)?.srt$/, "");
+if (!/^\d+$/.test(fileId)) {
+res.statusCode = 400;
+return res.end("Bad id");
+}
+return sendSrt(res, germanOnly(await download(fileId)));
+}
+res.statusCode = 404;
+res.end(Not found (path seen: /${parts.join("/")}, secret ${secret ? "ON" : "OFF"}));
+} catch (err) {
+console.error(err);
+if (parts[0] === "subtitles") return sendJson(res, 200, { subtitles: [] });
+res.statusCode = 502;
+res.end("Upstream error");
+}
+};
