@@ -17,15 +17,17 @@ const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const ARABIC_SDH_ONLY = false;     // true = only use Arabic files flagged SDH (rare)
 const ARABIC_COLOR = process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour as German (looks like ONE block)
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
+// Set env ALIGN_ARABIC=0 to use the Arabic file's own timing untouched.
+const ALIGN_ARABIC = process.env.ALIGN_ARABIC !== "0";
 const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
-const DUAL_OPTIONS = 3;            // how many dual (German+Arabic) choices to list
-const GERMAN_ONLY_OPTIONS = 2;     // how many plain German SDH choices to list
+const DUAL_OPTIONS = 6;            // how many dual (German+Arabic) choices to list
+const GERMAN_ONLY_OPTIONS = 3;     // how many plain German SDH choices to list
 const READ_MS_PER_CHAR = 55;       // minimum on-screen time per character (about 18 chars/second)
 const MIN_CUE_MS = 1500;           // no subtitle stays shorter than this (if the next one allows)
 const MAX_CUE_MS = 7000;
 const WYZIE_PENALTY = 10;          // small score penalty for Wyzie files (they carry no ratings)
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
-const CACHE_V = "4";               // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "5";               // bump to force players/CDN to re-fetch subtitle files
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -531,7 +533,7 @@ function mergeDual(deText, arText) {
   const de = mergeFragments(parseSrt(deText));
   const arRaw = parseSrt(arText);
   if (!de.length) return deText;
-  const al = bestAlignment(de, arRaw);
+  const al = ALIGN_ARABIC ? bestAlignment(de, arRaw) : { map: (t) => t };
   const ar = arRaw
     .map((c) => ({
       start: Math.round(al.map(c.start)),
@@ -660,17 +662,20 @@ module.exports = async (req, res) => {
         const de = rank([...deOs, ...deWy], fileTokens);
         const ar = rank([...arOs, ...arWy], fileTokens);
 
-        // Dual choices: best German files, each paired with the best-matching Arabic file.
+        // Dual choices: best German on top + best Arabic underneath first, then the other
+        // top-German x top-Arabic combinations, so you can compare and keep the one that fits.
         if (ar.length) {
-          de.slice(0, DUAL_OPTIONS).forEach((d, i) => {
-            const a = bestArabicFor(d, ar, fileTokens);
-            if (a) {
-              subtitles.push({
-                id: `dual-${i + 1}-${shortId(d.ref)}-${shortId(a.ref)}`,
-                url: `${base}/dual/${d.ref}~${a.ref}.v${CACHE_V}.srt`,
-                lang: "ger"
-              });
-            }
+          const combos = [];
+          for (let i = 0; i < Math.min(3, de.length); i++)
+            for (let j = 0; j < Math.min(3, ar.length); j++) combos.push({ i, j });
+          combos.sort((x, y) => (x.i + x.j) - (y.i + y.j) || x.i - y.i);
+          combos.slice(0, DUAL_OPTIONS).forEach(({ i, j }, n) => {
+            const d = de[i], a = ar[j];
+            subtitles.push({
+              id: `dual-${n + 1}-${shortId(d.ref)}-${shortId(a.ref)}`,
+              url: `${base}/dual/${d.ref}~${a.ref}.v${CACHE_V}.srt`,
+              lang: "ger"
+            });
           });
         }
         // Plain German SDH alternatives, in case a dual one is off for your video.
