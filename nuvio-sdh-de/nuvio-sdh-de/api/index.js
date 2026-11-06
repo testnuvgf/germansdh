@@ -122,7 +122,7 @@ module.exports = async (req, res) => {
   const rawPath = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);
   const rawQuery = qIndex === -1 ? "" : rawUrl.slice(qIndex + 1);
   let pathString = rawPath;
-  if (rawQuery.startsWith("__p=")) pathString = "/" + rawQuery.slice(4);
+  if (rawQuery.startsWith("__p=")) pathString = "/" + rawQuery.slice(4).replace(/%2F/gi, "/");
   const parts = pathString
     .split("/")
     .filter(Boolean)
