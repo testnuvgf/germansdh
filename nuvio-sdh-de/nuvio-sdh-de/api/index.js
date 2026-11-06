@@ -11,7 +11,7 @@
 //           SYNC_OFFSET_MS (optional: shift all subtitles, in ms)
 //           OS_API_BASE, WYZIE_BASE (optional, testing only)
 
-const UA = "NuvioSdhDe v2.1.0";
+const UA = "NuvioSdhDe v2.1.1";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 
@@ -32,7 +32,9 @@ const MIN_CUE_MS = 1500;           // no subtitle stays shorter than this (if th
 const MAX_CUE_MS = 7000;
 const WYZIE_PENALTY = 10;          // small score penalty for Wyzie files (they carry no ratings)
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
-const CACHE_V = "6";               // bump to force players/CDN to re-fetch subtitle files
+// Stretch all times (fixes drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
+const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
+const CACHE_V = "7";               // bump to force players/CDN to re-fetch subtitle files
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -483,6 +485,36 @@ function germanLtr(text) {
     .join("\n");
 }
 
+// Removes SDH noise from the German track: [Musik], (Leute jubeln), {..}, music lines, and
+// ALL-CAPS speaker labels such as "MAMA:". Cues that end up empty are dropped.
+function cleanSdh(cues) {
+  const out = [];
+  for (const c of cues) {
+    const lines = c.text
+      .replace(/\[[^\]]*\]|\([^)]*\)|\{[^}]*\}/g, "")
+      .split("\n")
+      .filter((l) => !/[♪♫]/.test(l) && !/^\s*#.*#?\s*$/.test(l))
+      .map((l) => l
+        .replace(/^(\s*(?:<[^>]+>)*\s*-?\s*(?:<[^>]+>)*\s*)[A-Z\u00C4\u00D6\u00DC][A-Z\u00C4\u00D6\u00DC0-9 .'\-]{1,24}:\s*(?:<\/[a-z]+>)?\s*/, "$1")
+        .replace(/<(\w+)[^>]*>\s*<\/\1>/g, "")
+        .replace(/\s{2,}/g, " ")
+        .replace(/<(i|b|u)>|<\/(i|b|u)>/g, (t) => t)
+        .trim())
+      .map((l) => ["i", "b", "u"].reduce((x, tg) => ((x.match(new RegExp(`<${tg}>`, "g")) || []).length === (x.match(new RegExp(`</${tg}>`, "g")) || []).length ? x : x.replace(new RegExp(`</?${tg}>`, "g"), "")), l))
+      .filter((l) => plain(l).replace(/^[-–—\s]+$/, "").trim());
+    if (!lines.length) continue;
+    out.push({ ...c, text: lines.join("\n") });
+  }
+  return out;
+}
+
+// parse + clean + glue fragments; falls back to the uncleaned text if cleaning would remove everything
+function loadGerman(text) {
+  const raw = parseSrt(text);
+  const cleaned = cleanSdh(raw);
+  return mergeFragments(cleaned.length ? cleaned : raw);
+}
+
 // Joins German cues that are one sentence cut in two (no end punctuation, tiny gap).
 function mergeFragments(cues) {
   const out = [];
@@ -520,22 +552,22 @@ function fixDurations(cues) {
 function finalize(cues) {
   cues.sort((a, b) => a.start - b.start);
   fixDurations(cues);
-  if (SYNC_OFFSET_MS) {
+  if (SYNC_OFFSET_MS || SYNC_RATIO !== 1) {
     for (const c of cues) {
-      c.start += SYNC_OFFSET_MS;
-      c.end += SYNC_OFFSET_MS;
+      c.start = c.start * SYNC_RATIO + SYNC_OFFSET_MS;
+      c.end = c.end * SYNC_RATIO + SYNC_OFFSET_MS;
     }
   }
   return toSrt(cues);
 }
 
 function germanOnly(text) {
-  const cues = mergeFragments(parseSrt(text));
+  const cues = loadGerman(text);
   return cues.length ? finalize(cues) : text;
 }
 
 function mergeDual(deText, arText) {
-  const de = mergeFragments(parseSrt(deText));
+  const de = loadGerman(deText);
   const arRaw = parseSrt(arText);
   if (!de.length) return deText;
   const al = ALIGN_ARABIC ? bestAlignment(de, arRaw) : { map: (t) => t };
@@ -650,7 +682,7 @@ const trCache = new Map();
 
 // German SDH on top, its own Arabic translation underneath: same cue, same timing.
 async function translatedDual(deText) {
-  const de = mergeFragments(parseSrt(deText));
+  const de = loadGerman(deText);
   if (!de.length) return deText;
   const src = de.map((c) => plain(c.text).replace(/\s+/g, " ").trim());
   let tr;
