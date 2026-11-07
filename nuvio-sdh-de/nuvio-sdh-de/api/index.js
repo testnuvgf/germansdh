@@ -5,7 +5,9 @@
 // Second language, two ways (SECOND_MODE):
 //   translate : the SAME German file is machine-translated cue by cue -> identical timing, perfect sync (what the repo does)
 //   files     : a real, best-rated subtitle file in the second language is merged under the German
-//   both      : (default) options 1 and 3 are translated, option 2 uses a real file
+//   both      : (default) 1 = German + own translation, timed like the best-rated real English file
+//               2 = German + that real English file (its timing is the master)
+//               3 = German + own translation, German file's own timing (exactly what the repo does)
 // Sources: OpenSubtitles.com REST API, Wyzie Subs (aggregator), SubDL.
 //
 // Env vars: OS_API_KEY, OS_USERNAME, OS_PASSWORD (required)
@@ -22,7 +24,7 @@
 const crypto = require("crypto");
 const zlib = require("zlib");
 
-const UA = "NuvioSdhDe v2.3.0";
+const UA = "NuvioSdhDe v2.5.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
@@ -40,15 +42,17 @@ const SECOND_SDH_ONLY = false;     // true = only use second-language files flag
 const SECOND_COLOR = process.env.SECOND_COLOR || process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
 const ALIGN_SECOND = process.env.ALIGN_SECOND !== "0" && process.env.ALIGN_ARABIC !== "0";
-const COMPACT_MAX = 90;            // join a cue's lines into one when the whole thing is this short
-const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 100;
-const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2800;
-const MAX_CUE_MS = Number(process.env.MAX_CUE_MS) || 10000;
+const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
+const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 0;   // 0 = keep each cue exactly as long as the file says
+const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 1200;       // only cues shorter than this are lengthened
+const MAX_CUE_MS = Number(process.env.MAX_CUE_MS) || 7000;        // cues longer than this are cut (they linger on screen)
+const MERGE_FRAGMENTS = process.env.MERGE_FRAGMENTS === "1";        // 1 = glue split sentences (shows words before they are spoken)
+const ANCHOR_SECOND = process.env.ANCHOR !== "german";             // real-file option: timing of the second-language file is the master
 const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so they start slightly behind
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
-const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1.04271;
-const CACHE_V = "10";              // bump to force players/CDN to re-fetch subtitle files
+const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
+const CACHE_V = "12";              // bump to force players/CDN to re-fetch subtitle files
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -57,7 +61,7 @@ const wyzieBase = process.env.WYZIE_BASE || WYZIE_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "2.3.0",
+  version: "2.5.0",
   name: "German SDH + English (dual)",
   description: "German SDH (spoken words) on top, English underneath, in one subtitle. Sources: OpenSubtitles, Wyzie, SubDL.",
   resources: ["subtitles"],
@@ -505,7 +509,8 @@ function mergeFragments(cues) {
 function loadGerman(text) {
   const raw = parseSrt(text);
   const cleaned = cleanSdh(raw);
-  return mergeFragments(cleaned.length ? cleaned : raw);
+  const cues = cleaned.length ? cleaned : raw;
+  return MERGE_FRAGMENTS ? mergeFragments(cues) : cues;
 }
 
 // ===== Alignment ==============================================================
@@ -529,7 +534,7 @@ const isSoundCue = (t) => {
 // Frame-rate stretch + offset (coarse then fine search), then local drift per ~8 minutes.
 // Returns { map(t) } converting a second-language timestamp to German time.
 function computeMap(de, ar) {
-  const identity = { map: (t) => t };
+  const identity = { map: (t) => t, ratio: 1, offset: 0 };
   if (!de.length || !ar.length) return identity;
 
   const ref = de.filter((c) => !isSoundCue(c.text));
@@ -594,7 +599,7 @@ function computeMap(de, ar) {
     pts.push({ t: g.reduce((a, x) => a + x.t, 0) / g.length, d: ds[ds.length >> 1] });
   }
   pts.sort((x, y) => x.t - y.t);
-  if (!pts.length) return { map: map0 };
+  if (!pts.length) return { map: map0, ratio: best.r, offset: off0 };
 
   const drift = (t) => {
     if (t <= pts[0].t) return pts[0].d;
@@ -607,13 +612,13 @@ function computeMap(de, ar) {
     }
     return 0;
   };
-  return { map: (t) => { const m = map0(t); return m + drift(m); } };
+  return { map: (t) => { const m = map0(t); return m + drift(m); }, ratio: best.r, offset: off0 };
 }
 
 // Alignment plus a "quality": the share of German cues that now have a second-language cue starting within 1 s.
 // A low quality means the file is another episode / cut and should not be used.
 function bestAlignment(de, ar) {
-  const al = ALIGN_SECOND ? computeMap(de, ar) : { map: (t) => t };
+  const al = ALIGN_SECOND ? computeMap(de, ar) : { map: (t) => t, ratio: 1, offset: 0 };
   const ref = de.filter((c) => !isSoundCue(c.text));
   const base = ref.length >= 10 ? ref : de;
   const starts = ar.map((c) => al.map(c.start)).sort((x, y) => x - y);
@@ -623,7 +628,7 @@ function bestAlignment(de, ar) {
     n++;
     if (Math.abs(nearest(starts, base[i].start) - base[i].start) <= 1000) hit++;
   }
-  return { map: al.map, quality: n ? hit / n : 0 };
+  return { map: al.map, ratio: al.ratio, offset: al.offset, quality: n ? hit / n : 0 };
 }
 
 // ===== Look: bidi marks, joining, durations ===================================
@@ -669,16 +674,20 @@ function germanBlock(text) {
     .join("\n");
 }
 
-// Gives every cue enough time to be read (never shortens, never runs into the next cue).
+// Keeps the file's own timing. Only cues shorter than MIN_CUE_MS are lengthened (never into the next cue),
+// and cues longer than MAX_CUE_MS are cut so nothing lingers on screen.
 function fixDurations(cues) {
   for (let i = 0; i < cues.length; i++) {
     const c = cues[i];
     const next = cues[i + 1];
     const chars = plain(c.text).replace(/\s+/g, " ").trim().length;
-    const want = Math.min(MAX_CUE_MS, Math.max(MIN_CUE_MS, chars * READ_MS_PER_CHAR));
-    let end = Math.max(c.end, c.start + want);
-    if (next) end = Math.min(end, Math.max(c.end, next.start - 60));
-    c.end = end;
+    const want = Math.max(MIN_CUE_MS, READ_MS_PER_CHAR ? chars * READ_MS_PER_CHAR : 0);
+    let end = c.end;
+    if (end - c.start < want) {
+      end = c.start + want;
+      if (next) end = Math.min(end, Math.max(c.end, next.start - 60));
+    }
+    c.end = Math.min(end, c.start + MAX_CUE_MS);
   }
   return cues;
 }
@@ -701,45 +710,53 @@ function germanOnly(de) {
 
 // ===== Merging ================================================================
 
-// Every second-language cue goes under the German cue it overlaps most, or the closest one within 1.5 s,
-// so the second language does not drop out just because the two files are a fraction of a second apart.
-function mergeDual(de, arRaw, al) {
+// Pairs each cue of `others` with the base cue it overlaps most, or the closest one within 1.5 s.
+function attachNearest(base, others) {
   const TOL = 1500;
-  const ar = arRaw
-    .map((c) => ({
-      start: Math.round(al.map(c.start)),
-      end: Math.round(al.map(c.end)),
-      text: secondBlock(c.text)
-    }))
-    .filter((c) => c.text);
-
-  const attached = de.map(() => []);
+  const attached = base.map(() => []);
   const standalone = [];
-  for (const a of ar) {
+  for (const a of others) {
     let bestI = -1, bestO = -Infinity;
-    for (let i = 0; i < de.length; i++) {
-      const d = de[i];
+    for (let i = 0; i < base.length; i++) {
+      const d = base[i];
       if (d.start > a.end + TOL) break;
       if (d.end < a.start - TOL) continue;
       const o = Math.min(d.end, a.end) - Math.max(d.start, a.start); // negative = gap between them
       if (o > bestO) { bestO = o; bestI = i; }
     }
-    if (bestI >= 0) attached[bestI].push(a);
-    else standalone.push(a);
+    if (bestI >= 0) attached[bestI].push(a); else standalone.push(a);
   }
+  return { attached, standalone };
+}
 
-  const out = de.map((d, i) => {
-    if (!attached[i].length) return { start: d.start, end: d.end, text: d.text };
-    const next = de[i + 1];
-    const cap = next ? next.start - 60 : Infinity;
-    let end = d.end;
-    for (const a of attached[i]) end = Math.max(end, Math.min(a.end, cap, d.end + TOL));
-    return { start: d.start, end, text: `${germanBlock(d.text)}\n${attached[i].map((a) => a.text).join("\n")}` };
-  });
-  // Cues far from any German cue are kept, so no line is lost.
-  for (const a of standalone) out.push({ start: a.start, end: a.end, text: a.text });
+const shift = (cues, al) => cues.map((c) => ({ start: Math.round(al.map(c.start)), end: Math.round(al.map(c.end)), text: c.text }));
+
+// German timing is the master (what the repo does): the second language goes under each German cue.
+function mergeDual(de, sec, al) {
+  const { attached, standalone } = attachNearest(de, shift(sec, al));
+  const out = de.map((d, i) => ({
+    start: d.start,
+    end: d.end,
+    text: attached[i].length ? `${germanBlock(d.text)}\n${attached[i].map((a) => a.text).join("\n")}` : d.text
+  }));
+  for (const a of standalone) out.push(a); // far from any German cue: kept, so no line is lost
   return finalize(out);
 }
+
+// Second-language timing is the master: the German cues are mapped onto it (this also removes a 25 vs 23.976 fps drift).
+function mergeAnchored(sec, de, al) {
+  const { attached, standalone } = attachNearest(sec, shift(de, al));
+  const out = sec.map((s, i) => ({
+    start: s.start,
+    end: s.end,
+    text: attached[i].length ? `${germanBlock(attached[i].map((d) => d.text).join("\n"))}\n${s.text}` : s.text
+  }));
+  for (const d of standalone) out.push({ start: d.start, end: d.end, text: d.text });
+  return finalize(out);
+}
+
+// cues of a real second-language file, cleaned to spoken words (sound-only cues disappear)
+const cleanSecond = (raw) => raw.map((c) => ({ ...c, text: secondBlock(c.text) })).filter((c) => c.text);
 
 // ===== Translation of the German file itself (what the repo does) ============
 // DeepL if DEEPL_KEY is set (official, best quality), otherwise Google's free web endpoint.
@@ -820,10 +837,11 @@ function translationUnits(text) {
   return lines.some((l) => /^(<[^>]+>)*[-\u2013\u2014]/.test(l)) ? lines : [lines.join(" ")];
 }
 
-const trCache = new Map();
+const trCache = new Map();   // German ref -> translated text per German cue (index-aligned with the cues)
 
-// German cue + its own translation: same cue, same timing. Returns null when translating failed.
-async function translatedDual(de) {
+// Translated text for every German cue, or null when translating failed.
+async function getTranslations(deRef, de) {
+  if (trCache.has(deRef)) return trCache.get(deRef);
   const flat = [];
   de.forEach((c, i) => translationUnits(c.text).forEach((t, k) => flat.push({ i, k, t: plain(t).replace(/\s+/g, " ").trim() })));
   let tr;
@@ -831,31 +849,67 @@ async function translatedDual(de) {
   if (tr.filter(Boolean).length < flat.length * 0.6) return null;
   const per = de.map(() => []);
   flat.forEach((f, n) => { if (tr[n]) per[f.i][f.k] = tr[n]; });
-  return finalize(de.map((d, i) => {
-    const second = per[i].filter(Boolean).join("\n");
-    const block = second ? secondBlock(second) : "";
+  const second = per.map((p) => p.filter(Boolean).join("\n"));
+  trCache.set(deRef, second);
+  if (trCache.size > 10) trCache.delete(trCache.keys().next().value);
+  return second;
+}
+
+// German cue + its own translation, under the timing of `cues` (the German file's own, or re-timed).
+function buildTranslated(cues, second) {
+  return finalize(cues.map((d, i) => {
+    const block = second[i] ? secondBlock(second[i]) : "";
     return { start: d.start, end: d.end, text: block ? `${germanBlock(d.text)}\n${block}` : d.text };
   }));
 }
 
+// Alignment that moves the German cues onto the timeline of a well-rated REAL second-language file (null if none fits).
+// Such a file was timed from the actual speech, so this also removes constant offsets and 25 <-> 23.976 fps drift.
+async function anchorMap(de, refs) {
+  let best = null;
+  for (const ref of refs) {
+    let sec;
+    try {
+      sec = cleanSecond(parseSrt(await download(ref)));
+    } catch (e) {
+      console.error(`anchor file ${ref.slice(0, 12)} failed:`, e.message || e);
+      continue;
+    }
+    if (sec.length < 5) continue;
+    const al = bestAlignment(sec, de);   // reference = the real file, moving = the German cues
+    if (!best || al.quality > best.quality) best = al;
+    if (al.quality >= GOOD_FIT) break;
+  }
+  if (best && best.quality >= MIN_FIT) {
+    console.log(`anchored: fit ${best.quality.toFixed(2)}, ratio ${best.ratio.toFixed(4)}, offset ${Math.round(best.offset)} ms`);
+    return best;
+  }
+  console.error(`could not anchor (best fit ${best ? best.quality.toFixed(2) : "n/a"}), keeping German timing`);
+  return null;
+}
+
 // German + a REAL second-language file. Tries the refs in order; keeps the first that fits the German timing
 // well, otherwise the best-fitting one. Returns null when none is usable.
-async function buildWithFiles(de, refs) {
+async function buildWithFiles(de, refs, anchorSecond) {
   let chosen = null;
   for (const ref of refs) {
-    let raw;
+    let sec;
     try {
-      raw = parseSrt(await download(ref));
+      sec = cleanSecond(parseSrt(await download(ref)));
     } catch (e) {
       console.error(`second file ${ref.slice(0, 12)} failed:`, e.message || e);
       continue;
     }
-    if (raw.length < 5) continue;
-    const al = bestAlignment(de, raw);
-    if (!chosen || al.quality > chosen.al.quality) chosen = { raw, al };
+    if (sec.length < 5) continue;
+    const al = anchorSecond ? bestAlignment(sec, de) : bestAlignment(de, sec);
+    if (!chosen || al.quality > chosen.al.quality) chosen = { sec, al };
     if (al.quality >= GOOD_FIT) break;
   }
-  if (chosen && chosen.al.quality >= MIN_FIT) return mergeDual(de, chosen.raw, chosen.al);
+  if (chosen && chosen.al.quality >= MIN_FIT) {
+    const { al } = chosen;
+    console.log(`fit ${al.quality.toFixed(2)}, ratio ${al.ratio.toFixed(4)}, offset ${Math.round(al.offset)} ms, master ${anchorSecond ? "second file" : "german"}`);
+    return anchorSecond ? mergeAnchored(chosen.sec, de, al) : mergeDual(de, chosen.sec, al);
+  }
   console.error(`no usable second-language file (best fit ${chosen ? chosen.al.quality.toFixed(2) : "n/a"})`);
   return null;
 }
@@ -877,6 +931,7 @@ function sendSrt(res, text) {
   res.end(text);
 }
 
+const outCache = new Map();
 const safe = (p) => p.catch((e) => { console.error(e); return []; });
 
 module.exports = async (req, res) => {
@@ -950,6 +1005,7 @@ module.exports = async (req, res) => {
       const extraRaw = (parts[3] || "").replace(/\.json$/, "");
       const extra = Object.fromEntries(new URLSearchParams(extraRaw));
       const subtitles = [];
+      console.log("extra:", JSON.stringify(extra));   // does the player send videoHash / filename / videoSize?
 
       if (id.startsWith("tt") && process.env.OS_API_KEY) {
         const fileTokens = tokens(extra.filename || "");
@@ -971,6 +1027,11 @@ module.exports = async (req, res) => {
           key: `tr-${shortId(de[i].ref)}`,
           path: `tr/${de[i].ref}${se.slice(0, FALLBACK_FILES + 1).map((c) => "~" + c.ref).join("")}`
         });
+        // translated + re-timed to the best-rated real file (needs a real file to anchor to)
+        const anchOpt = (i) => ({
+          key: `tra-${shortId(de[i].ref)}-${shortId(se[0].ref)}`,
+          path: `tra/${de[i].ref}${se.slice(0, FALLBACK_FILES + 1).map((c) => "~" + c.ref).join("")}`
+        });
         // real-file option: the j-th best file first, the others as fallbacks
         const fileOpt = (i, j) => {
           const others = se.map((_, k) => k).filter((k) => k !== j).slice(0, FALLBACK_FILES);
@@ -988,12 +1049,13 @@ module.exports = async (req, res) => {
             .filter(([i, j]) => de[i] && se[j]).slice(0, DUAL_OPTIONS)
             .forEach(([i, j]) => opts.push(fileOpt(i, j)));
         } else {
-          // both: 1 = best German + its own translation (perfect sync), 2 = best German + best-rated real file,
-          //       3 = 2nd German + its own translation
-          if (de[0]) opts.push(trOpt(0));
-          if (de[0] && se[0]) opts.push(fileOpt(0, 0));
-          if (de[1]) opts.push(trOpt(1));
-          else if (de[0] && se[1]) opts.push(fileOpt(0, 1));
+          // both: 1 = translation re-timed to the best-rated real file, 2 = that real file under the German,
+          //       3 = translation with the German file's own timing. No real file at all: 3 translated options.
+          if (de[0] && se[0]) {
+            opts.push(anchOpt(0), fileOpt(0, 0), trOpt(0));
+          } else {
+            for (let i = 0; i < DUAL_OPTIONS; i++) if (de[i]) opts.push(trOpt(i));
+          }
         }
         opts.slice(0, DUAL_OPTIONS).forEach((o, n) => {
           subtitles.push({ id: `dual-${n + 1}-${o.key}`, url: `${base}/${o.path}.v${CACHE_V}.srt`, lang: "ger" });
@@ -1006,8 +1068,8 @@ module.exports = async (req, res) => {
       return sendJson(res, 200, { subtitles }, "public, s-maxage=3600");
     }
 
-    // /dual/<germanRef>[~<fileRef>...].vN.srt  and  /tr/<germanRef>[~<fallbackFileRef>...].vN.srt
-    if ((parts[0] === "dual" || parts[0] === "tr") && parts[1]) {
+    // /dual/<de>[~<file>...] real file merged | /tr/<de>[~<file>...] translated | /tra/<de>~<file>... translated + re-timed
+    if (["dual", "tr", "tra"].includes(parts[0]) && parts[1]) {
       const m = parts[1].match(/^([\w-]+)((?:~[\w-]+)*)(?:\.v\d+)?\.srt$/);
       if (!m) {
         res.statusCode = 400;
@@ -1015,23 +1077,26 @@ module.exports = async (req, res) => {
       }
       const deRef = m[1];
       const refs = m[2] ? m[2].slice(1).split("~") : [];
-
-      if (parts[0] === "tr" && trCache.has(deRef)) return sendSrt(res, trCache.get(deRef));
+      const cacheKey = `${parts[0]}/${parts[1]}`;
+      if (outCache.has(cacheKey)) return sendSrt(res, outCache.get(cacheKey));
 
       const deText = await download(deRef);
       const de = loadGerman(deText);
       if (!de.length) return sendSrt(res, deText);
 
       let out = null;
-      if (parts[0] === "tr") {
-        out = await translatedDual(de);
-        if (out) {
-          trCache.set(deRef, out);
-          if (trCache.size > 20) trCache.delete(trCache.keys().next().value);
+      if (parts[0] !== "dual") {
+        const second = await getTranslations(deRef, de);
+        if (second) {
+          const al = parts[0] === "tra" ? await anchorMap(de, refs) : null;
+          out = buildTranslated(al ? shift(de, al) : de, second);
         }
       }
-      if (!out) out = await buildWithFiles(de, refs);
-      return sendSrt(res, out || germanOnly(de));
+      if (!out) out = await buildWithFiles(de, refs, parts[0] !== "tr" && ANCHOR_SECOND);
+      out = out || germanOnly(de);
+      outCache.set(cacheKey, out);
+      if (outCache.size > 30) outCache.delete(outCache.keys().next().value);
+      return sendSrt(res, out);
     }
 
     res.statusCode = 404;
