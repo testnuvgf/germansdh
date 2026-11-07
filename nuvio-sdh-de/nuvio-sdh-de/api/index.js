@@ -47,7 +47,7 @@ const MAX_CUE_MS = Number(process.env.MAX_CUE_MS) || 10000;
 const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so they start slightly behind
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
-const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
+const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1.04271;
 const CACHE_V = "10";              // bump to force players/CDN to re-fetch subtitle files
 // ---------------------------------------------------------------------------
 
