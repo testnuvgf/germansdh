@@ -21,20 +21,20 @@ const ARABIC_COLOR = process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty 
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
 // "translate" (default): Arabic = machine translation of the SAME German file -> identical timing, perfect sync.
 // "files": merge a separate human-made Arabic file (can drift against the German one).
-const ARABIC_MODE = process.env.ARABIC_MODE === "files" ? "files" : "translate";
+const ARABIC_MODE = process.env.ARABIC_MODE === "translate" ? "translate" : "files";
 // Set env ALIGN_ARABIC=0 to use the Arabic file's own timing untouched.
 const ALIGN_ARABIC = process.env.ALIGN_ARABIC !== "0";
 const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
 const DUAL_OPTIONS = 6;            // how many dual (German+Arabic) choices to list
 const GERMAN_ONLY_OPTIONS = 2;     // how many plain German SDH choices to list
-const READ_MS_PER_CHAR = 55;       // minimum on-screen time per character (about 18 chars/second)
-const MIN_CUE_MS = 1500;           // no subtitle stays shorter than this (if the next one allows)
-const MAX_CUE_MS = 7000;
+const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 95;  // on-screen time per character (higher = subtitles stay longer)
+const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2800;      // every subtitle stays at least this long (if the next one allows)
+const MAX_CUE_MS = Number(process.env.MAX_CUE_MS) || 10000;
 const WYZIE_PENALTY = 10;          // small score penalty for Wyzie files (they carry no ratings)
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (fixes drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
 const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
-const CACHE_V = "7";               // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "8";               // bump to force players/CDN to re-fetch subtitle files
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -472,7 +472,7 @@ function styled(text, color) {
 }
 
 function arabicBlock(text) {
-  const lines = text.replace(/<[^>]+>/g, "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const lines = text.replace(/<[^>]+>/g, "").replace(/\[[^\]]*\]|\([^)]*\)|\{[^}]*\}/g, "").split("\n").map((l) => l.trim()).filter(Boolean);
   return compactLines(lines).map(fixArabicLine).filter(Boolean).join("\n");
 }
 
