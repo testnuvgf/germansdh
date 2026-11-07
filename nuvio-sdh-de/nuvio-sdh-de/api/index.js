@@ -42,8 +42,8 @@ const SECOND_SDH_ONLY = false;     // true = only use second-language files flag
 const SECOND_COLOR = process.env.SECOND_COLOR || process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
 const ALIGN_SECOND = process.env.ALIGN_SECOND !== "0" && process.env.ALIGN_ARABIC !== "0";
-const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 79;  // reading time per character of BOTH languages (60 = ~17 chars/s)
-const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2500;       // cues shorter than this are lengthened (never into the next cue)
+const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 85;  // reading time per character of BOTH languages (60 = ~17 chars/s)
+const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2800;       // cues shorter than this are lengthened (never into the next cue)
 const MAX_CUE_MS = Number(process.env.MAX_CUE_MS) || 7000;        // cues longer than this are cut (they linger on screen)
 const MERGE_FRAGMENTS = process.env.MERGE_FRAGMENTS === "1";        // 1 = glue split sentences (shows words before they are spoken)
 const ANCHOR_SECOND = process.env.ANCHOR !== "german";             // real-file option: timing of the second-language file is the master
@@ -52,7 +52,7 @@ const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
 const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
 const CACHE_V = "16";              // bump to force players/CDN to re-fetch subtitle files
-const LEAD_MS = process.env.LEAD_MS === undefined ? 300 : Number(process.env.LEAD_MS) || 0;   // show each cue this much BEFORE its start
+const LEAD_MS = process.env.LEAD_MS === undefined ? 350 : Number(process.env.LEAD_MS) || 0;   // show each cue this much BEFORE its start
 const LINE_MAX = Number(process.env.LINE_MAX) || 84;   // one line per language up to this many characters (about 95 % of the picture width); longer ones are broken in two. Lower it if your player wraps lines early.
 // a cue of at most this many words that continues the previous (unfinished) sentence is merged into it; 0 = off
 const ORPHAN_WORDS = process.env.ORPHAN_WORDS === undefined ? 2 : Number(process.env.ORPHAN_WORDS) || 0;
