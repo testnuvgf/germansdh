@@ -1,40 +1,45 @@
 // Stremio-protocol subtitle addon (works with Nuvio).
-// Offers DUAL subtitles: German SDH on top, Arabic translation underneath, merged into one track,
-// plus plain German SDH alternatives.
-// Sources: the official OpenSubtitles.com REST API + Wyzie Subs (sub.wyzie.io) as a second source.
+// Every option is a DUAL subtitle: German SDH (spoken words only) on top, Arabic underneath.
+//
+// Sources: OpenSubtitles.com REST API, Wyzie Subs (sub.wyzie.io, itself an aggregator of several providers)
+//          and SubDL (api.subdl.com). Wyzie and SubDL are optional and switched on by their keys.
 //
 // Env vars: OS_API_KEY, OS_USERNAME, OS_PASSWORD (required)
-//           DEEPL_KEY (optional but recommended: better Arabic translation, free tier 500k chars/month)
-//           ARABIC_MODE=files (optional: use separate Arabic files instead of translating)
-//           WYZIE_KEY    (optional: enables Wyzie Subs as an extra source)
+//           WYZIE_KEY    (optional: Wyzie Subs, queries several providers at once)
+//           SUBDL_KEY    (optional: SubDL, free key from subdl.com)
 //           ADDON_SECRET (optional: puts every route under /<secret>/)
-//           SYNC_OFFSET_MS (optional: shift all subtitles, in ms)
-//           OS_API_BASE, WYZIE_BASE (optional, testing only)
+//           SYNC_OFFSET_MS, SYNC_RATIO (optional: shift / stretch every subtitle)
+//           READ_MS_PER_CHAR, MIN_CUE_MS, MAX_CUE_MS (optional: how long cues stay on screen)
+//           ARABIC_COLOR, FONT_FACE, ALIGN_ARABIC=0 (optional look & feel)
+//           OS_API_BASE, WYZIE_BASE (testing only)
 
-const UA = "NuvioSdhDe v2.1.0";
+const crypto = require("crypto");
+const zlib = require("zlib");
+
+const UA = "NuvioSdhDe v2.2.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
+const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
+const SUBDL_DL = "https://dl.subdl.com";
 
 // ---- Settings you may want to change -------------------------------------
+const DUAL_OPTIONS = 3;            // how many dual (German + Arabic) choices to list
+const ARABIC_FALLBACKS = 2;        // extra Arabic files tried when the first one fails to download or does not fit
+const GOOD_FIT = 0.45;             // an Arabic file this well aligned with the German is accepted immediately
+const MIN_FIT = 0.2;               // below this the Arabic file is judged to be another episode/cut and dropped
 const ARABIC_SDH_ONLY = false;     // true = only use Arabic files flagged SDH (rare)
-const ARABIC_COLOR = process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour as German (looks like ONE block)
+const ARABIC_COLOR = process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour as German
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
-// "translate" (default): Arabic = machine translation of the SAME German file -> identical timing, perfect sync.
-// "files": merge a separate human-made Arabic file (can drift against the German one).
-const ARABIC_MODE = process.env.ARABIC_MODE === "translate" ? "translate" : "files";
-// Set env ALIGN_ARABIC=0 to use the Arabic file's own timing untouched.
-const ALIGN_ARABIC = process.env.ALIGN_ARABIC !== "0";
+const ALIGN_ARABIC = process.env.ALIGN_ARABIC !== "0"; // 0 = use the Arabic file's own timing untouched
 const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
-const DUAL_OPTIONS = 6;            // how many dual (German+Arabic) choices to list
-const GERMAN_ONLY_OPTIONS = 2;     // how many plain German SDH choices to list
-const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 95;  // on-screen time per character (higher = subtitles stay longer)
-const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2800;      // every subtitle stays at least this long (if the next one allows)
+const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 95;
+const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2800;
 const MAX_CUE_MS = Number(process.env.MAX_CUE_MS) || 10000;
-const WYZIE_PENALTY = 10;          // small score penalty for Wyzie files (they carry no ratings)
+const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so they start slightly behind
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
-// Stretch all times (fixes drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
+// Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
 const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
-const CACHE_V = "8";               // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "9";               // bump to force players/CDN to re-fetch subtitle files
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -43,9 +48,9 @@ const wyzieBase = process.env.WYZIE_BASE || WYZIE_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "2.1.0",
+  version: "2.2.0",
   name: "German SDH + Arabic (dual)",
-  description: "Best-rated German SDH subtitles with an Arabic translation underneath, from OpenSubtitles and Wyzie.",
+  description: "German SDH (spoken words) with the best-rated Arabic subtitle underneath. Sources: OpenSubtitles, Wyzie, SubDL.",
   resources: ["subtitles"],
   types: ["movie", "series"],
   idPrefixes: ["tt"],
@@ -55,24 +60,25 @@ const MANIFEST = {
 
 // ===== File references =======================================================
 // A "ref" identifies one subtitle file inside our own URLs:
-//   digits        -> OpenSubtitles file_id
-//   "w" + base64url(url) -> a Wyzie download URL
+//   digits                 -> OpenSubtitles file_id
+//   "w" + base64url(url)   -> a Wyzie download URL
+//   "s" + base64url(path|season|episode) -> a SubDL zip
 
-const crypto = require("crypto");
 const shortId = (ref) => crypto.createHash("sha1").update(ref).digest("hex").slice(0, 10);
+const b64 = (s) => Buffer.from(s, "utf8").toString("base64url");
+const unb64 = (s) => Buffer.from(s, "base64url").toString("utf8");
 
 const WYZIE_HOST = /(^|\.)wyzie\.(io|ru)$/i;
-
-function wyzieRef(url) {
-  return "w" + Buffer.from(url, "utf8").toString("base64url");
-}
+const SUBDL_PATH = /^\/subtitle\/[\w.\-]+\.zip$/;
 
 function wyzieUrlFromRef(ref) {
-  const url = new URL(Buffer.from(ref.slice(1), "base64url").toString("utf8"));
+  const url = new URL(unb64(ref.slice(1)));
   // Only ever fetch from Wyzie itself, never an arbitrary host.
   if (url.protocol !== "https:" || !WYZIE_HOST.test(url.hostname)) throw new Error("bad wyzie url");
   return url.toString();
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ===== OpenSubtitles API ====================================================
 
@@ -85,15 +91,10 @@ function osHeaders(extra = {}) {
   };
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// Only ONE login runs at a time; everybody else waits for it. OpenSubtitles allows ~1 login/second,
-// so parallel logins (German + Arabic download at once) were answered with 429.
+// Only ONE login runs at a time; everybody else waits for it (OpenSubtitles answers parallel logins with 429).
 let loginPromise = null;
 function login() {
-  if (!loginPromise) {
-    loginPromise = doLogin().finally(() => { loginPromise = null; });
-  }
+  if (!loginPromise) loginPromise = doLogin().finally(() => { loginPromise = null; });
   return loginPromise;
 }
 
@@ -152,13 +153,17 @@ async function searchLang(type, id, extra, lang, hearing, extraParams = {}) {
         downloads: a.download_count || 0,
         trusted: a.from_trusted === true,
         hashMatch: a.moviehash_match === true,
-        machine: a.machine_translated === true || a.ai_translated === true
+        machine: a.machine_translated === true || a.ai_translated === true,
+        hiUnknown: false
       };
     })
     .filter((c) => c.ref);
 }
 
-// ===== Wyzie Subs API ========================================================
+// ===== Wyzie Subs API (aggregates several providers) =========================
+
+// First boolean found among the possible "hearing impaired" field names, else undefined.
+const hiFlag = (d) => [d.isHearingImpaired, d.hearingImpaired, d.hi].find((v) => typeof v === "boolean");
 
 async function searchWyzie(type, id, lang, hearing) {
   const key = process.env.WYZIE_KEY;
@@ -171,38 +176,83 @@ async function searchWyzie(type, id, lang, hearing) {
     params.season = season;
     params.episode = episode;
   }
-  const qs = Object.keys(params).map((k) => `${k}=${encodeURIComponent(params[k])}`).join("&");
-  const call = (q) => fetch(`${wyzieBase}/search?${q}`, {
+  const call = (p) => fetch(`${wyzieBase}/search?${Object.keys(p).map((k) => `${k}=${encodeURIComponent(p[k])}`).join("&")}`, {
     headers: { "User-Agent": UA, Accept: "application/json" },
     signal: AbortSignal.timeout(8000)
   });
-  let r = await call(qs);
+  let r = await call(params);
   if (r.status === 400) {
     // some deployments reject source=all; retry with the default source
     delete params.source;
-    r = await call(Object.keys(params).map((k) => `${k}=${encodeURIComponent(params[k])}`).join("&"));
+    r = await call(params);
   }
   if (!r.ok) throw new Error(`wyzie search failed (${lang}): ${r.status}`);
   const list = await r.json();
   if (!Array.isArray(list)) return [];
 
-  return list
+  let items = list
     .filter((d) => d && d.url && String(d.language || "").toLowerCase() === lang)
     .filter((d) => !d.format || String(d.format).toLowerCase() === "srt")
-    .filter((d) => !hearing || d.isHearingImpaired === true)
     .filter((d) => {
       try { return WYZIE_HOST.test(new URL(d.url).hostname); } catch { return false; }
-    })
-    .map((d) => ({
-      ref: wyzieRef(d.url),
-      source: "wyzie",
-      release: [d.matchedRelease, d.release, d.fileName, d.media].filter(Boolean).join(" "),
-      ratings: 0,
-      downloads: 0,
-      trusted: false,
-      hashMatch: false,
-      machine: false
-    }));
+    });
+  // keep only flagged hearing-impaired files when the API tells us which ones they are
+  const known = items.some((d) => hiFlag(d) !== undefined);
+  if (hearing && known) items = items.filter((d) => hiFlag(d) === true);
+
+  return items.map((d) => ({
+    ref: "w" + b64(d.url),
+    source: "wyzie",
+    release: [d.matchedRelease, d.release, d.fileName, d.media].filter(Boolean).join(" "),
+    ratings: 0,
+    downloads: 0,
+    trusted: false,
+    hashMatch: false,
+    machine: false,
+    hiUnknown: hearing && !known
+  }));
+}
+
+// ===== SubDL API ==============================================================
+
+async function searchSubdl(type, id, lang, hearing) {
+  const key = process.env.SUBDL_KEY;
+  if (!key) return [];
+  const [imdb, season, episode] = id.split(":");
+  const L = lang.toUpperCase();
+  const params = { api_key: key, imdb_id: imdb, languages: L, type: type === "series" ? "tv" : "movie", subs_per_page: 30 };
+  if (type === "series") {
+    if (!season || !episode) return [];
+    params.season_number = season;
+    params.episode_number = episode;
+  }
+  if (hearing) params.hi = 1;
+  const qs = Object.keys(params).map((k) => `${k}=${encodeURIComponent(params[k])}`).join("&");
+  const r = await fetch(`${SUBDL_API}?${qs}`, {
+    headers: { "User-Agent": UA, Accept: "application/json" },
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!r.ok) throw new Error(`subdl search failed (${lang}): ${r.status}`);
+  const j = await r.json();
+  if (!j || j.status === false) return [];
+
+  let items = (j.subtitles || [])
+    .filter((d) => d && typeof d.url === "string" && SUBDL_PATH.test(d.url) && !d.full_season)
+    .filter((d) => !/^[a-z]{2}$/i.test(String(d.language || "")) || String(d.language).toUpperCase() === L);
+  const known = items.some((d) => typeof d.hi === "boolean");
+  if (hearing && known) items = items.filter((d) => d.hi === true);
+
+  return items.map((d) => ({
+    ref: "s" + b64(`${d.url}|${season || ""}|${episode || ""}`),
+    source: "subdl",
+    release: [d.release_name, d.name].filter(Boolean).join(" "),
+    ratings: 0,
+    downloads: 0,
+    trusted: false,
+    hashMatch: false,
+    machine: false,
+    hiUnknown: hearing && !known
+  }));
 }
 
 // ===== Downloading ===========================================================
@@ -248,11 +298,54 @@ async function downloadWyzie(ref) {
   return decodeText(Buffer.from(await f.arrayBuffer()));
 }
 
-function download(ref) {
-  return ref.startsWith("w") ? downloadWyzie(ref) : downloadOs(ref);
+// Minimal zip reader: returns the .srt inside a SubDL zip (for season packs, the one for this episode).
+function unzipSrt(buf, season, episode) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65600); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("not a zip file");
+  const total = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  const files = [];
+  for (let n = 0; n < total; n++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) break;
+    const method = buf.readUInt16LE(off + 10);
+    const csize = buf.readUInt32LE(off + 20);
+    const nlen = buf.readUInt16LE(off + 28), xlen = buf.readUInt16LE(off + 30), clen = buf.readUInt16LE(off + 32);
+    const lho = buf.readUInt32LE(off + 42);
+    files.push({ name: buf.subarray(off + 46, off + 46 + nlen).toString("utf8"), method, csize, lho });
+    off += 46 + nlen + xlen + clen;
+  }
+  const srts = files.filter((f) => /\.srt$/i.test(f.name));
+  if (!srts.length) throw new Error("no srt in zip");
+  let pick = srts[0];
+  if (srts.length > 1 && episode) {
+    const s = Number(season) || 0, e = Number(episode);
+    const re = new RegExp(`(s0*${s}[\\s._-]*e0*${e}(?!\\d))|(\\b0*${s}x0*${e}(?!\\d))`, "i");
+    pick = srts.find((f) => re.test(f.name)) || srts[0];
+  }
+  const ln = buf.readUInt16LE(pick.lho + 26), lx = buf.readUInt16LE(pick.lho + 28);
+  const start = pick.lho + 30 + ln + lx;
+  const data = buf.subarray(start, start + pick.csize);
+  return pick.method === 0 ? data : zlib.inflateRawSync(data);
 }
 
-// ===== Ranking: pick the best-matching, best-rated file ======================
+async function downloadSubdl(ref) {
+  const [path, season, episode] = unb64(ref.slice(1)).split("|");
+  if (!SUBDL_PATH.test(path)) throw new Error("bad subdl path");
+  const f = await fetch(`${SUBDL_DL}${path}`, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(15000) });
+  if (!f.ok) throw new Error(`subdl file fetch failed: ${f.status}`);
+  return decodeText(unzipSrt(Buffer.from(await f.arrayBuffer()), season, episode));
+}
+
+function download(ref) {
+  if (ref.startsWith("w")) return downloadWyzie(ref);
+  if (ref.startsWith("s")) return downloadSubdl(ref);
+  return downloadOs(ref);
+}
+
+// ===== Ranking ================================================================
 
 const STOP = new Set(["srt", "mkv", "mp4", "avi", "the", "de", "ger", "german", "sdh", "hi", "and", "ar", "arabic"]);
 
@@ -269,8 +362,8 @@ function jaccard(a, b) {
   return inter / (a.size + b.size - inter);
 }
 
-// Higher is better. Release similarity to the video file decides most timing problems.
-function score(c, fileTokens) {
+// German: the best SDH file = exact video match, then same release name, trusted, rated, popular.
+function scoreDe(c, fileTokens) {
   let s = 0;
   if (c.hashMatch) s += 1000;
   s += jaccard(tokens(c.release), fileTokens) * 100;
@@ -278,30 +371,36 @@ function score(c, fileTokens) {
   s += c.ratings * 5;
   s += Math.log10(c.downloads + 1) * 10;
   if (c.machine) s -= 40;
-  if (c.source === "wyzie") s -= WYZIE_PENALTY;
+  if (c.hiUnknown) s -= 30;
+  if (c.source !== "os") s -= OTHER_SOURCE_PENALTY;
   return s;
 }
 
-function rank(list, fileTokens) {
+// Arabic: the best NOTED (rated) file first, then popularity, then closeness to your video file.
+function scoreAr(c, fileTokens) {
+  let s = 0;
+  if (c.hashMatch) s += 1000;
+  s += c.ratings * 30;
+  s += Math.log10(c.downloads + 1) * 15;
+  if (c.trusted) s += 20;
+  s += jaccard(tokens(c.release), fileTokens) * 40;
+  if (c.machine) s -= 60;
+  if (c.source !== "os") s -= OTHER_SOURCE_PENALTY;
+  return s;
+}
+
+function rank(list, fileTokens, scorer) {
   const seen = new Set();
   return list
     .filter((c) => (seen.has(c.ref) ? false : (seen.add(c.ref), true)))
-    .map((c) => ({ ...c, score: score(c, fileTokens) }))
+    .map((c) => ({ ...c, score: scorer(c, fileTokens) }))
     .sort((a, b) => b.score - a.score);
 }
 
-// Best Arabic file for a given German pick: good on its own AND from the same release.
-function bestArabicFor(de, arList, fileTokens) {
-  const deTokens = tokens(de.release);
-  return arList
-    .map((c) => ({ c, s: score(c, fileTokens) + jaccard(tokens(c.release), deTokens) * 100 }))
-    .sort((a, b) => b.s - a.s)[0]?.c;
-}
-
-// ===== SRT parsing / alignment / merging =====================================
+// ===== SRT parsing ============================================================
 
 function parseSrt(text) {
-  text = text.replace(/^\uFEFF/, "").replace(/\r/g, "");
+  text = text.replace(/^﻿/, "").replace(/\r/g, "");
   const cues = [];
   for (const block of text.split(/\n\s*\n/)) {
     const lines = block.split("\n");
@@ -329,34 +428,100 @@ function toSrt(cues) {
 }
 
 // LRM/RLM, LRE/RLE/PDF/LRO/RLO, and the isolate controls.
-const BIDI = /[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const BIDI = /[‎‏‪-‮⁦-⁩]/g;
 const plain = (t) => t.replace(/<[^>]+>/g, "").replace(BIDI, "");
 
-// Cues that only describe sounds ([Musik], (lacht), ♪ ...) have no Arabic twin, so they must not
-// take part in the alignment.
+// ===== Cleaning: spoken words only ============================================
+
+// [Musik] (Leute jubeln) {..} are removed, then any lone bracket characters that are left over.
+function stripNoise(t) {
+  return t.replace(/\[[^\]]*\]|\([^)]*\)|\{[^}]*\}/g, "").replace(/[\[\](){}]/g, "");
+}
+
+// ALL-CAPS speaker labels like "MAMA:" or "- ELENA:" at the start of a line.
+const SPEAKER = /^(\s*(?:<[^>]+>)*\s*-?\s*(?:<[^>]+>)*\s*)[A-ZÄÖÜ][A-ZÄÖÜ0-9 .'\-]{1,24}:\s*(?:<\/[a-z]+>)?\s*/;
+
+function balanceTags(line) {
+  return ["i", "b", "u"].reduce((x, tg) => {
+    const open = (x.match(new RegExp(`<${tg}>`, "g")) || []).length;
+    const close = (x.match(new RegExp(`</${tg}>`, "g")) || []).length;
+    return open === close ? x : x.replace(new RegExp(`</?${tg}>`, "g"), "");
+  }, line);
+}
+
+// Returns the spoken lines of one cue (possibly none).
+function cleanLines(text, german) {
+  const before = text.split("\n").filter((l) => l.trim()).length;
+  const lines = stripNoise(text)
+    .split("\n")
+    .filter((l) => !/[♪♫]/.test(l) && !/^\s*#.*#?\s*$/.test(l))
+    .map((l) => (german ? l.replace(SPEAKER, "$1") : l))
+    .map((l) => balanceTags(l.replace(/<(\w+)[^>]*>\s*<\/\1>/g, "").replace(/\s{2,}/g, " ").trim()))
+    .filter((l) => plain(l).replace(/^[-–—\s]+$/, "").trim());
+  // the other speaker's line was sound-only: a lone dialogue dash makes no sense any more
+  if (before > 1 && lines.length === 1) lines[0] = lines[0].replace(/^((?:<[^>]+>)*)[-–—]\s*/, "$1");
+  return lines;
+}
+
+function cleanSdh(cues) {
+  const out = [];
+  for (const c of cues) {
+    const lines = cleanLines(c.text, true);
+    if (lines.length) out.push({ ...c, text: lines.join("\n") });
+  }
+  return out;
+}
+
+// Joins German cues that are one sentence cut in two (no end punctuation, tiny gap).
+function mergeFragments(cues) {
+  const out = [];
+  for (const c of cues) {
+    const prev = out[out.length - 1];
+    if (prev) {
+      const a = plain(prev.text).trim();
+      const b = plain(c.text).trim();
+      const complete = /[.?!…؟»"'\])]$/.test(a);
+      if (!complete && c.start - prev.end <= 400 && !/^[-–—\[(]/.test(b) && a.length + b.length <= 84) {
+        prev.text = `${prev.text.replace(/\n/g, " ")} ${c.text.replace(/\n/g, " ")}`;
+        prev.end = Math.max(prev.end, c.end);
+        continue;
+      }
+    }
+    out.push({ ...c });
+  }
+  return out;
+}
+
+// parse + clean + glue fragments; falls back to the uncleaned cues if cleaning would remove everything
+function loadGerman(text) {
+  const raw = parseSrt(text);
+  const cleaned = cleanSdh(raw);
+  return mergeFragments(cleaned.length ? cleaned : raw);
+}
+
+// ===== Alignment ==============================================================
+
+function nearest(arr, t) {
+  let lo = 0, hi = arr.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid] < t) lo = mid + 1; else hi = mid;
+  }
+  let v = arr[lo];
+  if (lo > 0 && Math.abs(arr[lo - 1] - t) < Math.abs(v - t)) v = arr[lo - 1];
+  return v;
+}
+
 const isSoundCue = (t) => {
   const p = plain(t).trim();
-  return /^[\[(♪#].*[\])♪#]?$/s.test(p) && /^[\[(♪]/.test(p) && /[\])♪]$/.test(p);
+  return /^[\[(♪]/.test(p) && /[\])♪]$/.test(p);
 };
 
-// Lines the Arabic file up with the German one:
-//  1. global frame-rate stretch + offset (coarse search over +-60 s, then 50 ms fine search),
-//  2. local drift correction per ~8 minute window (handles different cuts / ad breaks).
-// Returns { map(t) } that converts an Arabic timestamp to German time.
-function bestAlignment(de, ar) {
+// Frame-rate stretch + offset (coarse then fine search), then local drift per ~8 minutes.
+// Returns { map(t) } converting an Arabic timestamp to German time.
+function computeMap(de, ar) {
   const identity = { map: (t) => t };
   if (!de.length || !ar.length) return identity;
-
-  const near = (arr, t) => {
-    let lo = 0, hi = arr.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (arr[mid] < t) lo = mid + 1; else hi = mid;
-    }
-    let v = arr[lo];
-    if (lo > 0 && Math.abs(arr[lo - 1] - t) < Math.abs(v - t)) v = arr[lo - 1];
-    return v;
-  };
 
   const ref = de.filter((c) => !isSoundCue(c.text));
   const base = ref.length >= 10 ? ref : de;
@@ -367,12 +532,11 @@ function bestAlignment(de, ar) {
     let sc = 0;
     for (const c of sample) {
       const t = c.start - off;
-      if (Math.abs(near(scaled, t) - t) <= tol) sc++;
+      if (Math.abs(nearest(scaled, t) - t) <= tol) sc++;
     }
     return sc;
   };
 
-  // coarse
   let best = { r: 1, off: 0, score: -1 };
   let zero = 0;
   for (const r of ratios) {
@@ -388,7 +552,6 @@ function bestAlignment(de, ar) {
     best = { r: 1, off: 0, score: zero };
   }
 
-  // fine
   const scaledBest = ar.map((c) => c.start * best.r);
   let fineBest = { off: best.off, score: -1 };
   for (let off = best.off - 600; off <= best.off + 600; off += 50) {
@@ -398,19 +561,18 @@ function bestAlignment(de, ar) {
   const diffs = [];
   for (const c of sample) {
     const t = c.start - fineBest.off;
-    const d = t - near(scaledBest, t);
+    const d = t - nearest(scaledBest, t);
     if (Math.abs(d) <= 500) diffs.push(d);
   }
   diffs.sort((x, y) => x - y);
   const off0 = Math.round(fineBest.off + (diffs.length ? diffs[diffs.length >> 1] : 0));
   const map0 = (t) => t * best.r + off0;
 
-  // local drift per window
   const aligned = ar.map((c) => map0(c.start));
   const WIN = 8 * 60 * 1000;
   const groups = new Map();
   for (const c of base) {
-    const d = c.start - near(aligned, c.start);
+    const d = c.start - nearest(aligned, c.start);
     if (Math.abs(d) > 2000) continue;
     const k = Math.floor(c.start / WIN);
     if (!groups.has(k)) groups.set(k, []);
@@ -439,100 +601,62 @@ function bestAlignment(de, ar) {
   return { map: (t) => { const m = map0(t); return m + drift(m); } };
 }
 
-// Arabic needs explicit right-to-left handling, otherwise "?" "." "!" jump to the wrong end of the line.
-function fixArabicLine(line) {
-  let l = line.replace(BIDI, "").trim();
-  if (!l) return "";
-  // A question/exclamation mark typed at the logical START of the line belongs at the end.
-  const m = l.match(/^(-\s*)?([?\u061F!]+)\s*(.+)$/);
-  if (m) {
-    const endsWithMark = /[?\u061F!]$/.test(m[3]);
-    l = `${m[1] || ""}${m[3]}${endsWithMark ? "" : m[2]}`;
+// Alignment plus a "quality": the share of German cues that now have an Arabic cue starting within 1 s.
+// A low quality means the Arabic file is another episode / cut and should not be used.
+function bestAlignment(de, ar) {
+  const al = ALIGN_ARABIC ? computeMap(de, ar) : { map: (t) => t };
+  const ref = de.filter((c) => !isSoundCue(c.text));
+  const base = ref.length >= 10 ? ref : de;
+  const starts = ar.map((c) => al.map(c.start)).sort((x, y) => x - y);
+  const step = Math.max(1, Math.ceil(base.length / 600));
+  let n = 0, hit = 0;
+  for (let i = 0; i < base.length && starts.length; i += step) {
+    n++;
+    if (Math.abs(nearest(starts, base[i].start) - base[i].start) <= 1000) hit++;
   }
-  l = l.replace(/\?/g, "\u061F").replace(/(?<!\d),|,(?!\d)/g, "\u060C");
-  // RLM + RLE ... PDF + RLM: whole line is right-to-left and trailing punctuation stays at the left end.
-  const wrapped = `\u200F\u202B${l}\u202C\u200F`;
-  return styled(wrapped, ARABIC_COLOR);
+  return { map: al.map, quality: n ? hit / n : 0 };
 }
 
-// Short two-line cues read better as one line: it makes each language a single compact unit.
+// ===== Look: bidi marks, joining, durations ===================================
+
+function styled(text, color) {
+  if (!color && !FONT_FACE) return text;
+  const attrs = `${FONT_FACE ? ` face="${FONT_FACE}"` : ""}${color ? ` color="${color}"` : ""}`;
+  return `<font${attrs}>${text}</font>`;
+}
+
+// Short two-line cues read better as one line.
 function compactLines(lines) {
-  const ok = lines.length > 1 && !lines.some((l) => /^\s*[-\u2013\u2014]/.test(plain(l))) &&
+  const ok = lines.length > 1 && !lines.some((l) => /^\s*[-–—]/.test(plain(l))) &&
     lines.reduce((n, l) => n + plain(l).length, 0) <= COMPACT_MAX;
   return ok ? [lines.map((l) => l.trim()).join(" ")] : lines;
 }
 
-function styled(text, color) {
-  let out = text;
-  if (color || FONT_FACE) {
-    const attrs = `${FONT_FACE ? ` face="${FONT_FACE}"` : ""}${color ? ` color="${color}"` : ""}`;
-    out = `<font${attrs}>${out}</font>`;
+// Arabic line: a right-to-left mark at both ends keeps "." "?" "!" and the dialogue dash on the correct side.
+function fixArabicLine(line) {
+  let l = line.replace(BIDI, "").trim();
+  if (!l) return "";
+  // A question/exclamation mark typed at the logical START of the line belongs at the end.
+  const m = l.match(/^(-\s*)?([?؟!]+)\s*(.+)$/);
+  if (m) {
+    const endsWithMark = /[?؟!]$/.test(m[3]);
+    l = `${m[1] || ""}${m[3]}${endsWithMark ? "" : m[2]}`;
   }
-  return out;
+  l = l.replace(/\?/g, "؟").replace(/(?<!\d),|,(?!\d)/g, "،");
+  return styled(`‏${l}‏`, ARABIC_COLOR);
 }
 
 function arabicBlock(text) {
-  const lines = text.replace(/<[^>]+>/g, "").replace(/\[[^\]]*\]|\([^)]*\)|\{[^}]*\}/g, "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const lines = cleanLines(text.replace(/<[^>]+>/g, ""), false);
   return compactLines(lines).map(fixArabicLine).filter(Boolean).join("\n");
 }
 
-// Forces each German line to be laid out left-to-right (LRM + LRE ... PDF + LRM), so a player
-// that sees Arabic in the same cue does not flip the whole block into right-to-left order.
-function germanLtr(text) {
-  const lines = compactLines(text.split("\n").filter((l) => l.trim()));
-  return lines
-    .map((l) => styled(`\u200E\u202A${l.replace(BIDI, "")}\u202C\u200E`, ""))
+// German line: a left-to-right mark at both ends. Even when the player lays the whole cue out right-to-left
+// (because Arabic is present), the final "." and the leading "-" stay on the correct side.
+function germanBlock(text) {
+  return compactLines(text.split("\n").filter((l) => l.trim()))
+    .map((l) => styled(`‎${l.replace(BIDI, "")}‎`, ""))
     .join("\n");
-}
-
-// Removes SDH noise from the German track: [Musik], (Leute jubeln), {..}, music lines, and
-// ALL-CAPS speaker labels such as "MAMA:". Cues that end up empty are dropped.
-function cleanSdh(cues) {
-  const out = [];
-  for (const c of cues) {
-    const lines = c.text
-      .replace(/\[[^\]]*\]|\([^)]*\)|\{[^}]*\}/g, "")
-      .split("\n")
-      .filter((l) => !/[♪♫]/.test(l) && !/^\s*#.*#?\s*$/.test(l))
-      .map((l) => l
-        .replace(/^(\s*(?:<[^>]+>)*\s*-?\s*(?:<[^>]+>)*\s*)[A-Z\u00C4\u00D6\u00DC][A-Z\u00C4\u00D6\u00DC0-9 .'\-]{1,24}:\s*(?:<\/[a-z]+>)?\s*/, "$1")
-        .replace(/<(\w+)[^>]*>\s*<\/\1>/g, "")
-        .replace(/\s{2,}/g, " ")
-        .replace(/<(i|b|u)>|<\/(i|b|u)>/g, (t) => t)
-        .trim())
-      .map((l) => ["i", "b", "u"].reduce((x, tg) => ((x.match(new RegExp(`<${tg}>`, "g")) || []).length === (x.match(new RegExp(`</${tg}>`, "g")) || []).length ? x : x.replace(new RegExp(`</?${tg}>`, "g"), "")), l))
-      .filter((l) => plain(l).replace(/^[-–—\s]+$/, "").trim());
-    if (!lines.length) continue;
-    out.push({ ...c, text: lines.join("\n") });
-  }
-  return out;
-}
-
-// parse + clean + glue fragments; falls back to the uncleaned text if cleaning would remove everything
-function loadGerman(text) {
-  const raw = parseSrt(text);
-  const cleaned = cleanSdh(raw);
-  return mergeFragments(cleaned.length ? cleaned : raw);
-}
-
-// Joins German cues that are one sentence cut in two (no end punctuation, tiny gap).
-function mergeFragments(cues) {
-  const out = [];
-  for (const c of cues) {
-    const prev = out[out.length - 1];
-    if (prev) {
-      const a = plain(prev.text).trim();
-      const b = plain(c.text).trim();
-      const complete = /[.?!\u2026\u061F\u00BB"'\])]$/.test(a);
-      if (!complete && c.start - prev.end <= 400 && !/^[-\u2013\u2014\[(]/.test(b) && a.length + b.length <= 84) {
-        prev.text = `${prev.text.replace(/\n/g, " ")} ${c.text.replace(/\n/g, " ")}`;
-        prev.end = Math.max(prev.end, c.end);
-        continue;
-      }
-    }
-    out.push({ ...c });
-  }
-  return out;
 }
 
 // Gives every cue enough time to be read (never shortens, never runs into the next cue).
@@ -561,16 +685,16 @@ function finalize(cues) {
   return toSrt(cues);
 }
 
-function germanOnly(text) {
-  const cues = loadGerman(text);
-  return cues.length ? finalize(cues) : text;
+function germanOnly(de) {
+  return finalize(de.map((c) => ({ ...c })));
 }
 
-function mergeDual(deText, arText) {
-  const de = loadGerman(deText);
-  const arRaw = parseSrt(arText);
-  if (!de.length) return deText;
-  const al = ALIGN_ARABIC ? bestAlignment(de, arRaw) : { map: (t) => t };
+// ===== Merging ================================================================
+
+// Every Arabic cue goes under the German cue it overlaps most, or the closest one within 1.5 s,
+// so Arabic does not drop out just because the two files are a fraction of a second apart.
+function mergeDual(de, arRaw, al) {
+  const TOL = 1500;
   const ar = arRaw
     .map((c) => ({
       start: Math.round(al.map(c.start)),
@@ -579,119 +703,32 @@ function mergeDual(deText, arText) {
     }))
     .filter((c) => c.text);
 
-  // Each Arabic cue is attached ONCE, to the German cue it overlaps most.
   const attached = de.map(() => []);
   const standalone = [];
   for (const a of ar) {
-    let bestI = -1, bestO = 0;
+    let bestI = -1, bestO = -Infinity;
     for (let i = 0; i < de.length; i++) {
       const d = de[i];
-      if (d.start > a.end) break;
-      if (d.end < a.start) continue;
-      const o = Math.min(d.end, a.end) - Math.max(d.start, a.start);
+      if (d.start > a.end + TOL) break;
+      if (d.end < a.start - TOL) continue;
+      const o = Math.min(d.end, a.end) - Math.max(d.start, a.start); // negative = gap between them
       if (o > bestO) { bestO = o; bestI = i; }
     }
-    const need = bestI >= 0 ? Math.min(300, 0.3 * Math.min(a.end - a.start, de[bestI].end - de[bestI].start)) : 0;
-    if (bestI >= 0 && bestO >= need) attached[bestI].push(a.text);
+    if (bestI >= 0) attached[bestI].push(a);
     else standalone.push(a);
   }
 
-  const out = de.map((d, i) => ({
-    start: d.start,
-    end: d.end,
-    text: attached[i].length ? `${germanLtr(d.text)}\n${attached[i].join("\n")}` : d.text
-  }));
-  // Arabic cues that matched no German cue are kept, so no translation is lost.
+  const out = de.map((d, i) => {
+    if (!attached[i].length) return { start: d.start, end: d.end, text: d.text };
+    const next = de[i + 1];
+    const cap = next ? next.start - 60 : Infinity;
+    let end = d.end;
+    for (const a of attached[i]) end = Math.max(end, Math.min(a.end, cap, d.end + TOL));
+    return { start: d.start, end, text: `${germanBlock(d.text)}\n${attached[i].map((a) => a.text).join("\n")}` };
+  });
+  // Arabic cues far from any German cue are kept, so no line is lost.
   for (const a of standalone) out.push({ start: a.start, end: a.end, text: a.text });
   return finalize(out);
-}
-
-// ===== Machine translation (German -> Arabic) ===============================
-// DeepL if DEEPL_KEY is set (official, best quality), otherwise Google's free web endpoint.
-
-async function pool(items, limit, fn) {
-  const out = new Array(items.length);
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const i = next++;
-      out[i] = await fn(items[i], i);
-    }
-  }));
-  return out;
-}
-
-async function deeplChunk(chunk) {
-  const key = process.env.DEEPL_KEY;
-  const host = key.endsWith(":fx") ? "https://api-free.deepl.com" : "https://api.deepl.com";
-  const r = await fetch(`${host}/v2/translate`, {
-    method: "POST",
-    headers: { Authorization: `DeepL-Auth-Key ${key}`, "Content-Type": "application/json", "User-Agent": UA },
-    body: JSON.stringify({ text: chunk, source_lang: "DE", target_lang: "AR" }),
-    signal: AbortSignal.timeout(20000)
-  });
-  if (!r.ok) throw new Error(`deepl failed: ${r.status}`);
-  const j = await r.json();
-  return (j.translations || []).map((t) => t.text);
-}
-
-async function googleRaw(lines) {
-  const r = await fetch("https://translate.googleapis.com/translate_a/single?client=gtx&sl=de&tl=ar&dt=t", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0" },
-    body: "q=" + encodeURIComponent(lines.join("\n")),
-    signal: AbortSignal.timeout(15000)
-  });
-  if (!r.ok) throw new Error(`google translate failed: ${r.status}`);
-  const j = await r.json();
-  return (j[0] || []).map((seg) => seg[0] || "").join("").replace(/\n$/, "").split("\n");
-}
-
-async function googleChunk(chunk) {
-  const lines = await googleRaw(chunk);
-  if (lines.length === chunk.length) return lines;
-  // line count got mangled: translate this chunk one line at a time
-  return pool(chunk, 4, async (t) => (await googleRaw([t]))[0] || "");
-}
-
-// texts[i] -> Arabic text (or "" when it could not be translated)
-async function translateTexts(texts) {
-  const idx = texts.map((t, i) => (t ? i : -1)).filter((i) => i >= 0);
-  const chunks = [];
-  let cur = [], size = 0;
-  const maxItems = process.env.DEEPL_KEY ? 50 : 40;
-  for (const i of idx) {
-    if (cur.length && (cur.length >= maxItems || size + texts[i].length > 3500)) {
-      chunks.push(cur); cur = []; size = 0;
-    }
-    cur.push(i); size += texts[i].length;
-  }
-  if (cur.length) chunks.push(cur);
-
-  const run = process.env.DEEPL_KEY ? deeplChunk : googleChunk;
-  const res = await pool(chunks, 6, async (ids) => {
-    try { return await run(ids.map((i) => texts[i])); }
-    catch (e) { console.error(e); return []; }
-  });
-  const out = texts.map(() => "");
-  chunks.forEach((ids, c) => ids.forEach((i, k) => { out[i] = (res[c] && res[c][k]) || ""; }));
-  return out;
-}
-
-const trCache = new Map();
-
-// German SDH on top, its own Arabic translation underneath: same cue, same timing.
-async function translatedDual(deText) {
-  const de = loadGerman(deText);
-  if (!de.length) return deText;
-  const src = de.map((c) => plain(c.text).replace(/\s+/g, " ").trim());
-  let tr;
-  try { tr = await translateTexts(src); } catch (e) { console.error(e); return germanOnly(deText); }
-  if (!tr.some(Boolean)) return germanOnly(deText);
-  return finalize(de.map((d, i) => {
-    const ar = tr[i] ? arabicBlock(tr[i]) : "";
-    return { start: d.start, end: d.end, text: ar ? `${germanLtr(d.text)}\n${ar}` : d.text };
-  }));
 }
 
 // ===== HTTP handler ==========================================================
@@ -710,6 +747,8 @@ function sendSrt(res, text) {
   res.setHeader("Cache-Control", "public, s-maxage=604800, max-age=86400");
   res.end(text);
 }
+
+const safe = (p) => p.catch((e) => { console.error(e); return []; });
 
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -751,21 +790,29 @@ module.exports = async (req, res) => {
       return sendJson(res, 200, MANIFEST, "public, max-age=3600");
     }
 
-    // /debug/<type>/<imdb[:season:episode]>  -> shows what each source returned (no keys shown)
+    // /debug/<type>/<imdb[:season:episode]>  -> what each source returned (keys are never shown)
     if (parts[0] === "debug" && parts.length >= 3) {
       const type = parts[1];
       const id = parts[2];
       const run = async (name, fn) => {
-        try { const l = await fn(); return { name, count: l.length, sample: l.slice(0, 2).map((c) => c.release) }; }
-        catch (e) { return { name, error: String(e.message || e) }; }
+        try {
+          const l = await fn();
+          const via = {};
+          for (const c of l) via[c.source] = (via[c.source] || 0) + 1;
+          return { name, count: l.length, via, sample: l.slice(0, 2).map((c) => c.release) };
+        } catch (e) { return { name, error: String(e.message || e) }; }
       };
       const out = await Promise.all([
         run("os-de-sdh", () => searchLang(type, id, {}, "de", "only", { ai_translated: "exclude", machine_translated: "exclude" })),
         run("os-ar", () => searchLang(type, id, {}, "ar", ARABIC_SDH_ONLY ? "only" : "include")),
         run("wyzie-de-sdh", () => searchWyzie(type, id, "de", true)),
-        run("wyzie-ar", () => searchWyzie(type, id, "ar", ARABIC_SDH_ONLY))
+        run("wyzie-ar", () => searchWyzie(type, id, "ar", ARABIC_SDH_ONLY)),
+        run("subdl-de-sdh", () => searchSubdl(type, id, "de", true)),
+        run("subdl-ar", () => searchSubdl(type, id, "ar", ARABIC_SDH_ONLY))
       ]);
-      return sendJson(res, 200, { wyzieKeySet: !!process.env.WYZIE_KEY, osKeySet: !!process.env.OS_API_KEY, results: out });
+      return sendJson(res, 200, {
+        osKeySet: !!process.env.OS_API_KEY, wyzieKeySet: !!process.env.WYZIE_KEY, subdlKeySet: !!process.env.SUBDL_KEY, results: out
+      });
     }
 
     if (parts[0] === "subtitles" && parts.length >= 3) {
@@ -773,83 +820,77 @@ module.exports = async (req, res) => {
       const id = parts[2].replace(/\.json$/, "");
       const extraRaw = (parts[3] || "").replace(/\.json$/, "");
       const extra = Object.fromEntries(new URLSearchParams(extraRaw));
-      let subtitles = [];
+      const subtitles = [];
 
       if (id.startsWith("tt") && process.env.OS_API_KEY) {
         const fileTokens = tokens(extra.filename || "");
-        const safe = (p) => p.catch((e) => { console.error(e); return []; });
-        const [deOs, arOs, deWy, arWy] = await Promise.all([
+        const arHearing = ARABIC_SDH_ONLY;
+        const [deOs, arOs, deWy, arWy, deSd, arSd] = await Promise.all([
           safe(searchLang(type, id, extra, "de", "only", { ai_translated: "exclude", machine_translated: "exclude" })),
-          ARABIC_MODE === "files" ? safe(searchLang(type, id, extra, "ar", ARABIC_SDH_ONLY ? "only" : "include")) : Promise.resolve([]),
+          safe(searchLang(type, id, extra, "ar", arHearing ? "only" : "include")),
           safe(searchWyzie(type, id, "de", true)),
-          ARABIC_MODE === "files" ? safe(searchWyzie(type, id, "ar", ARABIC_SDH_ONLY)) : Promise.resolve([])
+          safe(searchWyzie(type, id, "ar", arHearing)),
+          safe(searchSubdl(type, id, "de", true)),
+          safe(searchSubdl(type, id, "ar", arHearing))
         ]);
-        const de = rank([...deOs, ...deWy], fileTokens);
-        const ar = rank([...arOs, ...arWy], fileTokens);
+        const de = rank([...deOs, ...deWy, ...deSd], fileTokens, scoreDe);
+        const ar = rank([...arOs, ...arWy, ...arSd], fileTokens, scoreAr);
 
-        // Dual choices: best German on top + best Arabic underneath first, then the other
-        // top-German x top-Arabic combinations, so you can compare and keep the one that fits.
-        if (ARABIC_MODE === "translate") {
-          de.slice(0, DUAL_OPTIONS).forEach((d, i) => {
-            subtitles.push({ id: `dual-tr-${i + 1}-${shortId(d.ref)}`, url: `${base}/tr/${d.ref}.v${CACHE_V}.srt`, lang: "ger" });
+        // Option 1 = best German + best-rated Arabic. The next ones swap in the 2nd German or the 2nd Arabic.
+        const pairs = [[0, 0], [1, 0], [0, 1], [1, 1], [2, 0], [0, 2]]
+          .filter(([i, j]) => de[i] && ar[j])
+          .slice(0, DUAL_OPTIONS);
+        pairs.forEach(([i, j], n) => {
+          const others = ar.map((_, k) => k).filter((k) => k !== j).slice(0, ARABIC_FALLBACKS);
+          const arRefs = [ar[j].ref, ...others.map((k) => ar[k].ref)];
+          subtitles.push({
+            id: `dual-${n + 1}-${shortId(de[i].ref)}-${shortId(ar[j].ref)}`,
+            url: `${base}/dual/${de[i].ref}~${arRefs.join("~")}.v${CACHE_V}.srt`,
+            lang: "ger"
           });
-        } else if (ar.length) {
-          const combos = [];
-          for (let i = 0; i < Math.min(3, de.length); i++)
-            for (let j = 0; j < Math.min(3, ar.length); j++) combos.push({ i, j });
-          combos.sort((x, y) => (x.i + x.j) - (y.i + y.j) || x.i - y.i);
-          combos.slice(0, DUAL_OPTIONS).forEach(({ i, j }, n) => {
-            const d = de[i], a = ar[j];
-            subtitles.push({
-              id: `dual-${n + 1}-${shortId(d.ref)}-${shortId(a.ref)}`,
-              url: `${base}/dual/${d.ref}~${a.ref}.v${CACHE_V}.srt`,
-              lang: "ger"
-            });
-          });
-        }
-        // Plain German SDH alternatives, in case a dual one is off for your video.
-        de.slice(0, GERMAN_ONLY_OPTIONS).forEach((d, i) => {
-          subtitles.push({ id: `de-sdh-${i + 1}-${shortId(d.ref)}`, url: `${base}/dl/${d.ref}.v${CACHE_V}.srt`, lang: "ger" });
         });
+        // No Arabic exists anywhere for this title: still offer the best German SDH instead of an empty list.
+        if (!pairs.length && de[0]) {
+          subtitles.push({ id: `de-only-${shortId(de[0].ref)}`, url: `${base}/dual/${de[0].ref}.v${CACHE_V}.srt`, lang: "ger" });
+        }
       }
       return sendJson(res, 200, { subtitles }, "public, s-maxage=3600");
     }
 
-    if (parts[0] === "tr" && parts[1]) {
-      const ref = parts[1].replace(/(?:\.v\d+)?\.srt$/, "");
-      if (!/^[\w-]+$/.test(ref)) {
-        res.statusCode = 400;
-        return res.end("Bad id");
-      }
-      if (!trCache.has(ref)) {
-        if (!token && !ref.startsWith("w")) await login();
-        trCache.set(ref, await translatedDual(await download(ref)));
-        if (trCache.size > 20) trCache.delete(trCache.keys().next().value);
-      }
-      return sendSrt(res, trCache.get(ref));
-    }
-
     if (parts[0] === "dual" && parts[1]) {
-      const m = parts[1].match(/^([\w-]+)~([\w-]+)(?:\.v\d+)?\.srt$/);
+      // /dual/<germanRef>~<arabicRef>[~<fallbackArabicRef>...].vN.srt
+      const m = parts[1].match(/^([\w-]+)((?:~[\w-]+)*)(?:\.v\d+)?\.srt$/);
       if (!m) {
         res.statusCode = 400;
         return res.end("Bad id");
       }
-      if (!token) await login();
-      const [deText, arText] = await Promise.all([
-        download(m[1]),
-        download(m[2]).catch((e) => { console.error(e); return null; })
-      ]);
-      return sendSrt(res, arText ? mergeDual(deText, arText) : germanOnly(deText));
-    }
+      const deRef = m[1];
+      const arRefs = m[2] ? m[2].slice(1).split("~") : [];
+      if (!token && [deRef, ...arRefs].some((r) => /^\d+$/.test(r))) await login();
 
-    if (parts[0] === "dl" && parts[1]) {
-      const ref = parts[1].replace(/(?:\.v\d+)?\.srt$/, "");
-      if (!/^[\w-]+$/.test(ref)) {
-        res.statusCode = 400;
-        return res.end("Bad id");
+      const deText = await download(deRef);
+      const de = loadGerman(deText);
+      if (!de.length) return sendSrt(res, deText);
+
+      // Try the Arabic candidates in order; keep the first that fits the German timing well,
+      // otherwise the best-fitting one. A failed download no longer silently drops the Arabic.
+      let chosen = null;
+      for (const ref of arRefs) {
+        let arRaw;
+        try {
+          arRaw = parseSrt(await download(ref));
+        } catch (e) {
+          console.error(`arabic ${ref.slice(0, 12)} failed:`, e.message || e);
+          continue;
+        }
+        if (arRaw.length < 5) continue;
+        const al = bestAlignment(de, arRaw);
+        if (!chosen || al.quality > chosen.al.quality) chosen = { arRaw, al };
+        if (al.quality >= GOOD_FIT) break;
       }
-      return sendSrt(res, germanOnly(await download(ref)));
+      if (chosen && chosen.al.quality >= MIN_FIT) return sendSrt(res, mergeDual(de, chosen.arRaw, chosen.al));
+      console.error(`no usable Arabic file (best fit ${chosen ? chosen.al.quality.toFixed(2) : "n/a"}), serving German only`);
+      return sendSrt(res, germanOnly(de));
     }
 
     res.statusCode = 404;
