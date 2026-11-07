@@ -18,13 +18,23 @@
 //           ADDON_SECRET (optional: puts every route under /<secret>/)
 //           SYNC_OFFSET_MS, SYNC_RATIO (optional: shift / stretch every subtitle)
 //           READ_MS_PER_CHAR, MIN_CUE_MS, MAX_CUE_MS (optional: how long cues stay on screen)
+//           END_PAD_MS (600), BRIDGE_GAP_MS (1000): keep a line on screen a little AFTER the file's end time, and close
+//                        gaps shorter than BRIDGE_GAP_MS between two lines, so text never vanishes while it is still spoken
+//           DRIFT_VARIANTS=0 (optional): hide the two extra "drift" entries in the subtitle list
 //           SECOND_COLOR, FONT_FACE, ALIGN_SECOND=0 (optional look & feel)
+//
+// Settings WITHOUT redeploying: put them in the install link, e.g.
+//   https://YOUR-APP.vercel.app/s_pad900_lead0_off-300/manifest.json          (no secret)
+//   https://YOUR-APP.vercel.app/YOUR_SECRET/s_pad900_lead0_off-300/manifest.json
+// keys: pad, bridge (ms) | lead (ms early) | off (ms, + = later) | ratio (drift, 1.04271 / 0.95904)
+//       read (ms per char) | min, max (ms on screen). Remove and re-add the addon in Nuvio after changing the link.
 //           OS_API_BASE, WYZIE_BASE (testing only)
 
 const crypto = require("crypto");
+const { AsyncLocalStorage } = require("async_hooks");
 const zlib = require("zlib");
 
-const UA = "NuvioSdhDe v2.8.1";
+const UA = "NuvioSdhDe v2.9.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
@@ -51,12 +61,44 @@ const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so t
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
 const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
-const CACHE_V = "16";              // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "17";              // bump to force players/CDN to re-fetch subtitle files
 const LEAD_MS = process.env.LEAD_MS === undefined ? 350 : Number(process.env.LEAD_MS) || 0;   // show each cue this much BEFORE its start
 const LINE_MAX = Number(process.env.LINE_MAX) || 84;   // one line per language up to this many characters (about 95 % of the picture width); longer ones are broken in two. Lower it if your player wraps lines early.
 // a cue of at most this many words that continues the previous (unfinished) sentence is merged into it; 0 = off
 const ORPHAN_WORDS = process.env.ORPHAN_WORDS === undefined ? 2 : Number(process.env.ORPHAN_WORDS) || 0;
 const SPACER = process.env.LANG_GAP === "0" ? "" : "\u200B\n";   // an empty line between German and the second language
+// The player's own subtitle delay moves start AND end together, so it can never keep a line on screen longer.
+// These two do: every cue is held END_PAD_MS past the file's end time, and a gap shorter than BRIDGE_GAP_MS between two
+// cues is closed (always at least 60 ms before the next cue starts).
+const END_PAD_MS = process.env.END_PAD_MS === undefined ? 600 : Number(process.env.END_PAD_MS) || 0;
+const BRIDGE_GAP_MS = process.env.BRIDGE_GAP_MS === undefined ? 1000 : Number(process.env.BRIDGE_GAP_MS) || 0;
+const DRIFT_VARIANTS = process.env.DRIFT_VARIANTS !== "0";   // two extra list entries for a delay that grows over the film
+
+// Timing settings for ONE request. Defaults come from the values above; the install link can override them
+// (see the header). AsyncLocalStorage keeps concurrent requests from seeing each other's settings.
+const DEFAULT_CFG = {
+  read: READ_MS_PER_CHAR, min: MIN_CUE_MS, max: MAX_CUE_MS, lead: LEAD_MS,
+  off: SYNC_OFFSET_MS, ratio: SYNC_RATIO, pad: END_PAD_MS, bridge: BRIDGE_GAP_MS
+};
+const CFG_LIMITS = {
+  read: [0, 300], min: [0, 8000], max: [1000, 20000], lead: [0, 2000],
+  off: [-60000, 60000], ratio: [0.9, 1.1], pad: [0, 3000], bridge: [0, 3000]
+};
+const cfgStore = new AsyncLocalStorage();
+const currentCfg = () => cfgStore.getStore() || DEFAULT_CFG;
+const CFG_SEG = /^s_[a-z0-9_.-]+$/i;
+function parseCfgSeg(seg) {
+  const over = {};
+  for (const m of seg.slice(2).matchAll(/([a-z]+)(-?\d+(?:\.\d+)?)/gi)) {
+    const k = m[1].toLowerCase(), v = Number(m[2]);
+    if (CFG_LIMITS[k] && Number.isFinite(v)) over[k] = Math.min(CFG_LIMITS[k][1], Math.max(CFG_LIMITS[k][0], v));
+  }
+  return over;
+}
+const cfgSegFrom = (over) => {
+  const e = Object.entries(over);
+  return e.length ? "s_" + e.map(([k, v]) => `${k}${v}`).join("_") : "";
+};
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -65,7 +107,7 @@ const wyzieBase = process.env.WYZIE_BASE || WYZIE_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "2.8.1",
+  version: "2.9.0",
   name: "German SDH + English (dual)",
   description: "German SDH (spoken words) on top, English underneath, in one subtitle. Sources: OpenSubtitles, Wyzie, SubDL.",
   resources: ["subtitles"],
@@ -724,38 +766,49 @@ function germanBlock(text) {
     .join("\n");
 }
 
-// Keeps the file's own timing. Only cues shorter than MIN_CUE_MS are lengthened (never into the next cue),
-// and cues longer than MAX_CUE_MS are cut so nothing lingers on screen.
+// Keeps the file's own timing. Cues shorter than the minimum are lengthened (never into the next cue), cues longer than
+// the maximum are cut, then every cue is held a little PAST its end time and short gaps are closed, so a line does not
+// vanish while the actor is still finishing the sentence.
 function fixDurations(cues) {
+  const cfg = currentCfg();
   for (let i = 0; i < cues.length; i++) {
     const c = cues[i];
     const next = cues[i + 1];
     const chars = plain(c.text).replace(/\s+/g, " ").trim().length;
-    const want = Math.max(MIN_CUE_MS, READ_MS_PER_CHAR ? chars * READ_MS_PER_CHAR : 0);
+    const want = Math.max(cfg.min, cfg.read ? chars * cfg.read : 0);
     let end = c.end;
     if (end - c.start < want) {
       end = c.start + want;
       if (next) end = Math.min(end, Math.max(c.end, next.start - 60));
     }
-    c.end = Math.min(end, c.start + MAX_CUE_MS);
+    c.end = Math.min(end, c.start + cfg.max);
+  }
+  for (let i = 0; i < cues.length; i++) {
+    const c = cues[i];
+    const next = cues[i + 1];
+    if (!next) { c.end += cfg.pad; continue; }
+    const room = next.start - 60;
+    if (room <= c.end) continue;
+    c.end = next.start - c.end <= cfg.bridge ? room : Math.min(c.end + cfg.pad, room);
   }
   return cues;
 }
 
 function finalize(cues) {
+  const cfg = currentCfg();
   cues.sort((a, b) => a.start - b.start);
-  if (LEAD_MS) {
+  if (cfg.lead) {
     // appear a little early so reading starts with the speech; never earlier than the previous cue's end
     for (let i = 0; i < cues.length; i++) {
       const floor = i ? Math.min(cues[i - 1].end, cues[i].start) : 0;
-      cues[i].start = Math.max(floor, cues[i].start - LEAD_MS);
+      cues[i].start = Math.max(floor, cues[i].start - cfg.lead);
     }
   }
   fixDurations(cues);
-  if (SYNC_OFFSET_MS || SYNC_RATIO !== 1) {
+  if (cfg.off || cfg.ratio !== 1) {
     for (const c of cues) {
-      c.start = c.start * SYNC_RATIO + SYNC_OFFSET_MS;
-      c.end = c.end * SYNC_RATIO + SYNC_OFFSET_MS;
+      c.start = c.start * cfg.ratio + cfg.off;
+      c.end = c.end * cfg.ratio + cfg.off;
     }
   }
   return toSrt(cues);
@@ -1075,9 +1128,20 @@ module.exports = async (req, res) => {
     parts.shift();
   }
 
-  const proto = req.headers["x-forwarded-proto"] || "http";
-  const base = `${proto}://${req.headers.host}${secret ? "/" + encodeURIComponent(secret) : ""}`;
+  // optional settings segment, e.g. /s_pad900_lead0_off-300/ (see the header)
+  let installOver = {};
+  let cfgSeg = "";
+  if (parts[0] && CFG_SEG.test(parts[0])) {
+    cfgSeg = parts.shift();
+    installOver = parseCfgSeg(cfgSeg);
+  }
+  const cfg = { ...DEFAULT_CFG, ...installOver };
 
+  const proto = req.headers["x-forwarded-proto"] || "http";
+  const root = `${proto}://${req.headers.host}${secret ? "/" + encodeURIComponent(secret) : ""}`;
+  const base = `${root}${cfgSeg ? "/" + cfgSeg : ""}`;
+
+  return cfgStore.run(cfg, async () => {
   try {
     if (parts[0] === "manifest.json") {
       return sendJson(res, 200, MANIFEST, "public, max-age=3600");
@@ -1133,11 +1197,13 @@ module.exports = async (req, res) => {
 
         // translated option: needs only the German file; real files are the fallback if translating fails
         const trOpt = (i) => ({
+          de: de[i], kind: "translated",
           key: `tr-${shortId(de[i].ref)}`,
           path: `tr/${de[i].ref}${se.slice(0, FALLBACK_FILES + 1).map((c) => "~" + c.ref).join("")}`
         });
         // translated + re-timed to the best-rated real file (needs a real file to anchor to)
         const anchOpt = (i) => ({
+          de: de[i], kind: "retimed",
           key: `tra-${shortId(de[i].ref)}-${shortId(se[0].ref)}`,
           path: `tra/${de[i].ref}${se.slice(0, FALLBACK_FILES + 1).map((c) => "~" + c.ref).join("")}`
         });
@@ -1145,6 +1211,7 @@ module.exports = async (req, res) => {
         const fileOpt = (i, j) => {
           const others = se.map((_, k) => k).filter((k) => k !== j).slice(0, FALLBACK_FILES);
           return {
+            de: de[i], kind: "real-file",
             key: `f-${shortId(de[i].ref)}-${shortId(se[j].ref)}`,
             path: `dual/${de[i].ref}~${[se[j].ref, ...others.map((k) => se[k].ref)].join("~")}`
           };
@@ -1166,9 +1233,25 @@ module.exports = async (req, res) => {
             for (let i = 0; i < DUAL_OPTIONS; i++) if (de[i]) opts.push(trOpt(i));
           }
         }
+        // The id is what Nuvio shows under "Allemand": make it say which file this is.
+        const SRC = { os: "OpenSubtitles", wyzie: "Wyzie", subdl: "SubDL" };
+        const labelOf = (o, n, extraTag) =>
+          `${n + 1}-${SRC[o.de.source] || o.de.source}${o.de.hashMatch ? "-exact-match" : ""}-${o.kind}${extraTag || ""}-${shortId(o.key).slice(0, 4)}`;
         opts.slice(0, DUAL_OPTIONS).forEach((o, n) => {
-          subtitles.push({ id: `dual-${n + 1}-${o.key}`, url: `${base}/${o.path}.v${CACHE_V}.srt`, lang: "ger" });
+          subtitles.push({ id: labelOf(o, n), url: `${base}/${o.path}.v${CACHE_V}.srt`, lang: "ger" });
         });
+        // Two extra entries: the best file again, with its times stretched. For a delay that GROWS over the film (a fixed
+        // delay cannot fix that): "early-drift" = text gets earlier and earlier, "late-drift" = later and later.
+        if (DRIFT_VARIANTS && opts[0]) {
+          [["early-drift", 1.04271], ["late-drift", 0.95904]].forEach(([tag, ratio]) => {
+            const seg = cfgSegFrom({ ...installOver, ratio });
+            subtitles.push({
+              id: labelOf(opts[0], subtitles.length, `-${tag}`),
+              url: `${root}/${seg}/${opts[0].path}.v${CACHE_V}.srt`,
+              lang: "ger"
+            });
+          });
+        }
         // files mode and no second-language file anywhere: still offer the best German SDH
         if (!subtitles.length && de[0]) {
           subtitles.push({ id: `de-only-${shortId(de[0].ref)}`, url: `${base}/dual/${de[0].ref}.v${CACHE_V}.srt`, lang: "ger" });
@@ -1186,7 +1269,7 @@ module.exports = async (req, res) => {
       }
       const deRef = m[1];
       const refs = m[2] ? m[2].slice(1).split("~") : [];
-      const cacheKey = `${parts[0]}/${parts[1]}`;
+      const cacheKey = `${cfgSeg}|${parts[0]}/${parts[1]}`;
       if (outCache.has(cacheKey)) return sendSrt(res, outCache.get(cacheKey));
 
       const deText = await download(deRef);
@@ -1216,4 +1299,5 @@ module.exports = async (req, res) => {
     res.statusCode = 502;
     res.end("Upstream error");
   }
+  });
 };
