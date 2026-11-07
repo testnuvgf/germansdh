@@ -24,7 +24,7 @@
 const crypto = require("crypto");
 const zlib = require("zlib");
 
-const UA = "NuvioSdhDe v2.6.0";
+const UA = "NuvioSdhDe v2.7.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
@@ -42,7 +42,6 @@ const SECOND_SDH_ONLY = false;     // true = only use second-language files flag
 const SECOND_COLOR = process.env.SECOND_COLOR || process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
 const ALIGN_SECOND = process.env.ALIGN_SECOND !== "0" && process.env.ALIGN_ARABIC !== "0";
-const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
 const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 60;  // reading time per character of BOTH languages (60 = ~17 chars/s)
 const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2000;       // cues shorter than this are lengthened (never into the next cue)
 const MAX_CUE_MS = Number(process.env.MAX_CUE_MS) || 7000;        // cues longer than this are cut (they linger on screen)
@@ -52,8 +51,12 @@ const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so t
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
 const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
-const CACHE_V = "13";              // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "14";              // bump to force players/CDN to re-fetch subtitle files
 const LEAD_MS = process.env.LEAD_MS === undefined ? 150 : Number(process.env.LEAD_MS) || 0;   // show each cue this much BEFORE its start
+const LINE_MAX = Number(process.env.LINE_MAX) || 46;   // longer lines are broken in two at a sentence end / comma / space near the middle
+// a cue of at most this many words that continues the previous (unfinished) sentence is merged into it; 0 = off
+const ORPHAN_WORDS = process.env.ORPHAN_WORDS === undefined ? 2 : Number(process.env.ORPHAN_WORDS) || 0;
+const SPACER = process.env.LANG_GAP === "0" ? "" : "\u200B\n";   // an empty line between German and the second language
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -62,7 +65,7 @@ const wyzieBase = process.env.WYZIE_BASE || WYZIE_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "2.6.0",
+  version: "2.7.0",
   name: "German SDH + English (dual)",
   description: "German SDH (spoken words) on top, English underneath, in one subtitle. Sources: OpenSubtitles, Wyzie, SubDL.",
   resources: ["subtitles"],
@@ -506,12 +509,36 @@ function mergeFragments(cues) {
   return out;
 }
 
+const wordCount = (t) => plain(t).trim().split(/\s+/).filter(Boolean).length;
+const hasDash = (t) => /(^|\n)\s*(<[^>]+>)*[-\u2013\u2014]/.test(t);
+const SENTENCE_END = /[.?!\u2026:"\u00BB\u201D)\]]$/;
+
+// A cue with only one or two words that belongs to the previous, unfinished sentence ("Ein bisschen" / "Hexengezwitscher?")
+// is joined to it instead of flashing up alone. Everything else keeps the file's own timing.
+function mergeOrphans(cues) {
+  const out = [];
+  for (const c of cues) {
+    const prev = out[out.length - 1];
+    if (prev && ORPHAN_WORDS) {
+      const a = plain(prev.text).trim(), b = plain(c.text).trim();
+      const small = wordCount(b) <= ORPHAN_WORDS || wordCount(a) <= ORPHAN_WORDS;
+      if (small && !SENTENCE_END.test(a) && c.start - prev.end <= 700 && !hasDash(prev.text) && !hasDash(c.text) && a.length + b.length <= 90) {
+        prev.text = `${prev.text.replace(/\n/g, " ")} ${c.text.replace(/\n/g, " ")}`;
+        prev.end = Math.max(prev.end, c.end);
+        continue;
+      }
+    }
+    out.push({ ...c });
+  }
+  return out;
+}
+
 // parse + clean + glue fragments; falls back to the uncleaned cues if cleaning would remove everything
 function loadGerman(text) {
   const raw = parseSrt(text);
   const cleaned = cleanSdh(raw);
   const cues = cleaned.length ? cleaned : raw;
-  return MERGE_FRAGMENTS ? mergeFragments(cues) : cues;
+  return MERGE_FRAGMENTS ? mergeFragments(cues) : mergeOrphans(cues);
 }
 
 // ===== Alignment ==============================================================
@@ -640,12 +667,34 @@ function styled(text, color) {
   return `<font${attrs}>${text}</font>`;
 }
 
-// Short two-line cues read better as one line.
-function compactLines(lines) {
-  const ok = lines.length > 1 && !lines.some((l) => /^\s*[-–—]/.test(plain(l))) &&
-    lines.reduce((n, l) => n + plain(l).length, 0) <= COMPACT_MAX;
-  return ok ? [lines.map((l) => l.trim()).join(" ")] : lines;
+// Breaks one long line in two where it reads best: after a sentence end, else after a comma, else at the space nearest the middle.
+function breakLine(text) {
+  const t = text.trim();
+  if (plain(t).length <= LINE_MAX) return [t];
+  const mid = t.length / 2;
+  let best = -1, bestScore = Infinity, inTag = false;
+  for (let i = 1; i < t.length - 1; i++) {
+    if (t[i] === "<") inTag = true;
+    else if (t[i] === ">") inTag = false;
+    else if (!inTag && t[i] === " ") {
+      const pen = /[.?!\u2026]/.test(t[i - 1]) ? 0 : /[,;:]/.test(t[i - 1]) ? 8 : 20;
+      const score = Math.abs(i - mid) + pen;
+      if (score < bestScore) { bestScore = score; best = i; }
+    }
+  }
+  return best < 0 ? [t] : [t.slice(0, best).trim(), t.slice(best + 1).trim()];
 }
+
+// Re-lays the lines of a cue: a sentence the file wrapped at some odd place ("Was wird / das?") is joined and broken again in
+// a sensible place; dialogue with dashes keeps one line per speaker.
+function layoutLines(lines) {
+  const clean = lines.map((l) => l.trim()).filter(Boolean);
+  const dialogue = clean.some((l) => /^(<[^>]+>)*[-\u2013\u2014]/.test(l));
+  return (dialogue ? clean : [clean.join(" ")]).flatMap(breakLine).map(balanceTags).filter(Boolean);
+}
+
+// German block + empty line + second-language block
+const joinLangs = (g, sec) => `${g}\n${SPACER}${sec}`;
 
 // Right-to-left language line: an RLM at both ends keeps "." "?" "!" and the dialogue dash on the correct side.
 function fixRtlLine(line) {
@@ -663,14 +712,14 @@ function fixRtlLine(line) {
 
 // The second-language lines of one cue (spoken words only).
 function secondBlock(text) {
-  const lines = compactLines(cleanLines(text.replace(/<[^>]+>/g, ""), !RTL));
+  const lines = layoutLines(cleanLines(text.replace(/<[^>]+>/g, ""), !RTL));
   return lines.map((l) => (RTL ? fixRtlLine(l) : styled(l.trim(), SECOND_COLOR))).filter(Boolean).join("\n");
 }
 
 // German lines of a dual cue. With a right-to-left second language an LRM at both ends keeps the final "." and the
 // leading "-" on the correct side even if the player lays the whole cue out right-to-left. With English: plain text.
 function germanBlock(text) {
-  return compactLines(text.split("\n").filter((l) => l.trim()))
+  return layoutLines(text.split("\n"))
     .map((l) => styled(RTL ? `\u200E${l.replace(BIDI, "")}\u200E` : l.replace(BIDI, ""), ""))
     .join("\n");
 }
@@ -745,7 +794,7 @@ function mergeDual(de, sec, al) {
   const out = de.map((d, i) => ({
     start: d.start,
     end: d.end,
-    text: attached[i].length ? `${germanBlock(d.text)}\n${attached[i].map((a) => a.text).join("\n")}` : d.text
+    text: attached[i].length ? joinLangs(germanBlock(d.text), attached[i].map((a) => a.text).join("\n")) : d.text
   }));
   for (const a of standalone) out.push(a); // far from any German cue: kept, so no line is lost
   return finalize(out);
@@ -757,7 +806,7 @@ function mergeAnchored(sec, de, al) {
   const out = sec.map((s, i) => ({
     start: s.start,
     end: s.end,
-    text: attached[i].length ? `${germanBlock(attached[i].map((d) => d.text).join("\n"))}\n${s.text}` : s.text
+    text: attached[i].length ? joinLangs(germanBlock(attached[i].map((d) => d.text).join("\n")), s.text) : s.text
   }));
   for (const d of standalone) out.push({ start: d.start, end: d.end, text: d.text });
   return finalize(out);
@@ -839,10 +888,58 @@ async function translateTexts(texts) {
   return out;
 }
 
-// Dialogue with dashes is translated line by line (separate speakers); a wrapped sentence as one piece.
-function translationUnits(text) {
-  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-  return lines.some((l) => /^(<[^>]+>)*[-\u2013\u2014]/.test(l)) ? lines : [lines.join(" ")];
+const isDashLine = (l) => /^\s*(<[^>]+>)*[-\u2013\u2014]/.test(l);
+
+// What goes to the translator: dash dialogue line by line (separate speakers); a sentence that the file cut into
+// several cues is translated as ONE sentence (much better than translating the halves), then shared back over those cues.
+function translationPlan(de) {
+  const units = [];
+  for (let i = 0; i < de.length; ) {
+    const lines = de[i].text.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (lines.some(isDashLine)) {
+      lines.forEach((l, k) => units.push({ text: l, cues: [i], line: k }));
+      i++;
+      continue;
+    }
+    const group = [i];
+    let total = plain(de[i].text).length;
+    while (group.length < 3) {
+      const j = group[group.length - 1], last = de[j], nxt = de[j + 1];
+      if (!nxt || SENTENCE_END.test(plain(last.text).trim())) break;
+      if (nxt.start - last.end > 1000 || nxt.text.split("\n").some(isDashLine)) break;
+      total += plain(nxt.text).length + 1;
+      if (total > 150) break;
+      group.push(j + 1);
+    }
+    units.push({ text: group.map((j) => de[j].text.replace(/\n/g, " ")).join(" "), cues: group, line: null });
+    i += group.length;
+  }
+  return units;
+}
+
+// Splits a translated sentence over several cues in proportion to the German parts, preferably after punctuation.
+function shareOut(text, weights) {
+  const words = text.split(/\s+/).filter(Boolean);
+  const n = weights.length;
+  if (words.length < n) return [text, ...Array(n - 1).fill("")];
+  const total = weights.reduce((a, b) => a + b, 0) || 1;
+  const cuts = [];
+  let acc = 0, prevCut = 0;
+  for (let i = 0; i < n - 1; i++) {
+    acc += weights[i];
+    let idx = Math.round((words.length * acc) / total);
+    for (const d of [0, 1, -1, 2, -2]) {
+      const j = idx + d;
+      if (j > prevCut && j < words.length && /[.,;:?!\u2026]$/.test(words[j - 1])) { idx = j; break; }
+    }
+    idx = Math.max(prevCut + 1, Math.min(idx, words.length - (n - 1 - i)));
+    cuts.push(idx);
+    prevCut = idx;
+  }
+  const parts = [];
+  let from = 0;
+  for (const c of [...cuts, words.length]) { parts.push(words.slice(from, c).join(" ")); from = c; }
+  return parts;
 }
 
 const trCache = new Map();   // German ref -> translated text per German cue (index-aligned with the cues)
@@ -850,13 +947,17 @@ const trCache = new Map();   // German ref -> translated text per German cue (in
 // Translated text for every German cue, or null when translating failed.
 async function getTranslations(deRef, de) {
   if (trCache.has(deRef)) return trCache.get(deRef);
-  const flat = [];
-  de.forEach((c, i) => translationUnits(c.text).forEach((t, k) => flat.push({ i, k, t: plain(t).replace(/\s+/g, " ").trim() })));
+  const units = translationPlan(de);
   let tr;
-  try { tr = await translateTexts(flat.map((f) => f.t)); } catch (e) { console.error(e); return null; }
-  if (tr.filter(Boolean).length < flat.length * 0.6) return null;
+  try { tr = await translateTexts(units.map((u) => plain(u.text).replace(/\s+/g, " ").trim())); } catch (e) { console.error(e); return null; }
+  if (tr.filter(Boolean).length < units.length * 0.6) return null;
   const per = de.map(() => []);
-  flat.forEach((f, n) => { if (tr[n]) per[f.i][f.k] = tr[n]; });
+  units.forEach((u, n) => {
+    if (!tr[n]) return;
+    if (u.line !== null) per[u.cues[0]][u.line] = tr[n];
+    else if (u.cues.length === 1) per[u.cues[0]][0] = tr[n];
+    else shareOut(tr[n], u.cues.map((j) => plain(de[j].text).length)).forEach((part, k) => { if (part) per[u.cues[k]][0] = part; });
+  });
   const second = per.map((p) => p.filter(Boolean).join("\n"));
   trCache.set(deRef, second);
   if (trCache.size > 10) trCache.delete(trCache.keys().next().value);
@@ -867,7 +968,7 @@ async function getTranslations(deRef, de) {
 function buildTranslated(cues, second) {
   return finalize(cues.map((d, i) => {
     const block = second[i] ? secondBlock(second[i]) : "";
-    return { start: d.start, end: d.end, text: block ? `${germanBlock(d.text)}\n${block}` : d.text };
+    return { start: d.start, end: d.end, text: block ? joinLangs(germanBlock(d.text), block) : d.text };
   }));
 }
 
