@@ -3,9 +3,9 @@
 // like https://github.com/awerks/stremio-double-subtitles but with German SDH as the source.
 //
 // Second language, two ways (SECOND_MODE):
-//   translate : the SAME German file is machine-translated cue by cue -> identical timing, perfect sync (what the repo does)
 //   files     : a real, best-rated subtitle file in the second language is merged under the German
-//   both      : (default) 1 = German + own translation, timed like the best-rated real English file
+//   translate : (default) the 3 best German SDH files, each with its own translation and the German file's own timing
+//   both      : 1 = German + own translation, timed like the best-rated real English file
 //               2 = German + that real English file (its timing is the master)
 //               3 = German + own translation, German file's own timing (exactly what the repo does)
 // Sources: OpenSubtitles.com REST API, Wyzie Subs (aggregator), SubDL.
@@ -24,7 +24,7 @@
 const crypto = require("crypto");
 const zlib = require("zlib");
 
-const UA = "NuvioSdhDe v2.5.0";
+const UA = "NuvioSdhDe v2.6.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
@@ -32,7 +32,7 @@ const SUBDL_DL = "https://dl.subdl.com";
 
 // ---- Settings you may want to change -------------------------------------
 const SECOND_LANG = (process.env.SECOND_LANG || "en").toLowerCase();
-const SECOND_MODE = ["translate", "files"].includes(process.env.SECOND_MODE) ? process.env.SECOND_MODE : "both";
+const SECOND_MODE = ["both", "files"].includes(process.env.SECOND_MODE) ? process.env.SECOND_MODE : "translate";
 const RTL = ["ar", "he", "fa", "ur"].includes(SECOND_LANG);
 const DUAL_OPTIONS = 3;            // how many dual choices to list
 const FALLBACK_FILES = 2;          // extra second-language files tried when the first one fails to download or does not fit
@@ -43,8 +43,8 @@ const SECOND_COLOR = process.env.SECOND_COLOR || process.env.ARABIC_COLOR || "";
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
 const ALIGN_SECOND = process.env.ALIGN_SECOND !== "0" && process.env.ALIGN_ARABIC !== "0";
 const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
-const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 0;   // 0 = keep each cue exactly as long as the file says
-const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 1200;       // only cues shorter than this are lengthened
+const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 60;  // reading time per character of BOTH languages (60 = ~17 chars/s)
+const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2000;       // cues shorter than this are lengthened (never into the next cue)
 const MAX_CUE_MS = Number(process.env.MAX_CUE_MS) || 7000;        // cues longer than this are cut (they linger on screen)
 const MERGE_FRAGMENTS = process.env.MERGE_FRAGMENTS === "1";        // 1 = glue split sentences (shows words before they are spoken)
 const ANCHOR_SECOND = process.env.ANCHOR !== "german";             // real-file option: timing of the second-language file is the master
@@ -52,7 +52,8 @@ const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so t
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
 const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
-const CACHE_V = "12";              // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "13";              // bump to force players/CDN to re-fetch subtitle files
+const LEAD_MS = process.env.LEAD_MS === undefined ? 150 : Number(process.env.LEAD_MS) || 0;   // show each cue this much BEFORE its start
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -61,7 +62,7 @@ const wyzieBase = process.env.WYZIE_BASE || WYZIE_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "2.5.0",
+  version: "2.6.0",
   name: "German SDH + English (dual)",
   description: "German SDH (spoken words) on top, English underneath, in one subtitle. Sources: OpenSubtitles, Wyzie, SubDL.",
   resources: ["subtitles"],
@@ -694,6 +695,13 @@ function fixDurations(cues) {
 
 function finalize(cues) {
   cues.sort((a, b) => a.start - b.start);
+  if (LEAD_MS) {
+    // appear a little early so reading starts with the speech; never earlier than the previous cue's end
+    for (let i = 0; i < cues.length; i++) {
+      const floor = i ? Math.min(cues[i - 1].end, cues[i].start) : 0;
+      cues[i].start = Math.max(floor, cues[i].start - LEAD_MS);
+    }
+  }
   fixDurations(cues);
   if (SYNC_OFFSET_MS || SYNC_RATIO !== 1) {
     for (const c of cues) {
