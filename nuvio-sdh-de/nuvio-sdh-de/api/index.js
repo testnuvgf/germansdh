@@ -1,36 +1,45 @@
 // Stremio-protocol subtitle addon (works with Nuvio).
-// Every option is a DUAL subtitle: German SDH (spoken words only) on top, Arabic underneath.
+// Every option is a DUAL subtitle: German SDH (spoken words only) on top, a second language (English) underneath,
+// like https://github.com/awerks/stremio-double-subtitles but with German SDH as the source.
 //
-// Sources: OpenSubtitles.com REST API, Wyzie Subs (sub.wyzie.io, itself an aggregator of several providers)
-//          and SubDL (api.subdl.com). Wyzie and SubDL are optional and switched on by their keys.
+// Second language, two ways (SECOND_MODE):
+//   translate : the SAME German file is machine-translated cue by cue -> identical timing, perfect sync (what the repo does)
+//   files     : a real, best-rated subtitle file in the second language is merged under the German
+//   both      : (default) options 1 and 3 are translated, option 2 uses a real file
+// Sources: OpenSubtitles.com REST API, Wyzie Subs (aggregator), SubDL.
 //
 // Env vars: OS_API_KEY, OS_USERNAME, OS_PASSWORD (required)
-//           WYZIE_KEY    (optional: Wyzie Subs, queries several providers at once)
-//           SUBDL_KEY    (optional: SubDL, free key from subdl.com)
+//           DEEPL_KEY    (optional, recommended: DeepL translation; otherwise Google's free web endpoint is used)
+//           SECOND_LANG  (default "en"; any 2-letter code, "ar" keeps the right-to-left handling)
+//           SECOND_MODE  (both | translate | files)
+//           WYZIE_KEY, SUBDL_KEY (optional extra sources)
 //           ADDON_SECRET (optional: puts every route under /<secret>/)
 //           SYNC_OFFSET_MS, SYNC_RATIO (optional: shift / stretch every subtitle)
 //           READ_MS_PER_CHAR, MIN_CUE_MS, MAX_CUE_MS (optional: how long cues stay on screen)
-//           ARABIC_COLOR, FONT_FACE, ALIGN_ARABIC=0 (optional look & feel)
+//           SECOND_COLOR, FONT_FACE, ALIGN_SECOND=0 (optional look & feel)
 //           OS_API_BASE, WYZIE_BASE (testing only)
 
 const crypto = require("crypto");
 const zlib = require("zlib");
 
-const UA = "NuvioSdhDe v2.2.0";
+const UA = "NuvioSdhDe v2.3.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
 const SUBDL_DL = "https://dl.subdl.com";
 
 // ---- Settings you may want to change -------------------------------------
-const DUAL_OPTIONS = 3;            // how many dual (German + Arabic) choices to list
-const ARABIC_FALLBACKS = 2;        // extra Arabic files tried when the first one fails to download or does not fit
-const GOOD_FIT = 0.45;             // an Arabic file this well aligned with the German is accepted immediately
-const MIN_FIT = 0.2;               // below this the Arabic file is judged to be another episode/cut and dropped
-const ARABIC_SDH_ONLY = false;     // true = only use Arabic files flagged SDH (rare)
-const ARABIC_COLOR = process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour as German
+const SECOND_LANG = (process.env.SECOND_LANG || "en").toLowerCase();
+const SECOND_MODE = ["translate", "files"].includes(process.env.SECOND_MODE) ? process.env.SECOND_MODE : "both";
+const RTL = ["ar", "he", "fa", "ur"].includes(SECOND_LANG);
+const DUAL_OPTIONS = 3;            // how many dual choices to list
+const FALLBACK_FILES = 2;          // extra second-language files tried when the first one fails to download or does not fit
+const GOOD_FIT = 0.45;             // a real file this well aligned with the German is accepted immediately
+const MIN_FIT = 0.2;               // below this the file is judged to be another episode/cut and dropped
+const SECOND_SDH_ONLY = false;     // true = only use second-language files flagged SDH
+const SECOND_COLOR = process.env.SECOND_COLOR || process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
-const ALIGN_ARABIC = process.env.ALIGN_ARABIC !== "0"; // 0 = use the Arabic file's own timing untouched
+const ALIGN_SECOND = process.env.ALIGN_SECOND !== "0" && process.env.ALIGN_ARABIC !== "0";
 const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
 const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 95;
 const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2800;
@@ -39,7 +48,7 @@ const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so t
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
 const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
-const CACHE_V = "9";               // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "10";              // bump to force players/CDN to re-fetch subtitle files
 // ---------------------------------------------------------------------------
 
 let token = null;
@@ -48,9 +57,9 @@ const wyzieBase = process.env.WYZIE_BASE || WYZIE_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "2.2.0",
-  name: "German SDH + Arabic (dual)",
-  description: "German SDH (spoken words) with the best-rated Arabic subtitle underneath. Sources: OpenSubtitles, Wyzie, SubDL.",
+  version: "2.3.0",
+  name: "German SDH + English (dual)",
+  description: "German SDH (spoken words) on top, English underneath, in one subtitle. Sources: OpenSubtitles, Wyzie, SubDL.",
   resources: ["subtitles"],
   types: ["movie", "series"],
   idPrefixes: ["tt"],
@@ -347,7 +356,7 @@ function download(ref) {
 
 // ===== Ranking ================================================================
 
-const STOP = new Set(["srt", "mkv", "mp4", "avi", "the", "de", "ger", "german", "sdh", "hi", "and", "ar", "arabic"]);
+const STOP = new Set(["srt", "mkv", "mp4", "avi", "the", "de", "ger", "german", "sdh", "hi", "and", "ar", "arabic", "en", "eng", "english"]);
 
 function tokens(s) {
   return new Set(
@@ -376,8 +385,8 @@ function scoreDe(c, fileTokens) {
   return s;
 }
 
-// Arabic: the best NOTED (rated) file first, then popularity, then closeness to your video file.
-function scoreAr(c, fileTokens) {
+// Second language: the best NOTED (rated) file first, then popularity, then closeness to your video file.
+function scoreSecond(c, fileTokens) {
   let s = 0;
   if (c.hashMatch) s += 1000;
   s += c.ratings * 30;
@@ -518,7 +527,7 @@ const isSoundCue = (t) => {
 };
 
 // Frame-rate stretch + offset (coarse then fine search), then local drift per ~8 minutes.
-// Returns { map(t) } converting an Arabic timestamp to German time.
+// Returns { map(t) } converting a second-language timestamp to German time.
 function computeMap(de, ar) {
   const identity = { map: (t) => t };
   if (!de.length || !ar.length) return identity;
@@ -601,10 +610,10 @@ function computeMap(de, ar) {
   return { map: (t) => { const m = map0(t); return m + drift(m); } };
 }
 
-// Alignment plus a "quality": the share of German cues that now have an Arabic cue starting within 1 s.
-// A low quality means the Arabic file is another episode / cut and should not be used.
+// Alignment plus a "quality": the share of German cues that now have a second-language cue starting within 1 s.
+// A low quality means the file is another episode / cut and should not be used.
 function bestAlignment(de, ar) {
-  const al = ALIGN_ARABIC ? computeMap(de, ar) : { map: (t) => t };
+  const al = ALIGN_SECOND ? computeMap(de, ar) : { map: (t) => t };
   const ref = de.filter((c) => !isSoundCue(c.text));
   const base = ref.length >= 10 ? ref : de;
   const starts = ar.map((c) => al.map(c.start)).sort((x, y) => x - y);
@@ -632,30 +641,31 @@ function compactLines(lines) {
   return ok ? [lines.map((l) => l.trim()).join(" ")] : lines;
 }
 
-// Arabic line: a right-to-left mark at both ends keeps "." "?" "!" and the dialogue dash on the correct side.
-function fixArabicLine(line) {
+// Right-to-left language line: an RLM at both ends keeps "." "?" "!" and the dialogue dash on the correct side.
+function fixRtlLine(line) {
   let l = line.replace(BIDI, "").trim();
   if (!l) return "";
   // A question/exclamation mark typed at the logical START of the line belongs at the end.
-  const m = l.match(/^(-\s*)?([?؟!]+)\s*(.+)$/);
+  const m = l.match(/^(-\s*)?([?\u061F!]+)\s*(.+)$/);
   if (m) {
-    const endsWithMark = /[?؟!]$/.test(m[3]);
+    const endsWithMark = /[?\u061F!]$/.test(m[3]);
     l = `${m[1] || ""}${m[3]}${endsWithMark ? "" : m[2]}`;
   }
-  l = l.replace(/\?/g, "؟").replace(/(?<!\d),|,(?!\d)/g, "،");
-  return styled(`‏${l}‏`, ARABIC_COLOR);
+  l = l.replace(/\?/g, "\u061F").replace(/(?<!\d),|,(?!\d)/g, "\u060C");
+  return styled(`\u200F${l}\u200F`, SECOND_COLOR);
 }
 
-function arabicBlock(text) {
-  const lines = cleanLines(text.replace(/<[^>]+>/g, ""), false);
-  return compactLines(lines).map(fixArabicLine).filter(Boolean).join("\n");
+// The second-language lines of one cue (spoken words only).
+function secondBlock(text) {
+  const lines = compactLines(cleanLines(text.replace(/<[^>]+>/g, ""), !RTL));
+  return lines.map((l) => (RTL ? fixRtlLine(l) : styled(l.trim(), SECOND_COLOR))).filter(Boolean).join("\n");
 }
 
-// German line: a left-to-right mark at both ends. Even when the player lays the whole cue out right-to-left
-// (because Arabic is present), the final "." and the leading "-" stay on the correct side.
+// German lines of a dual cue. With a right-to-left second language an LRM at both ends keeps the final "." and the
+// leading "-" on the correct side even if the player lays the whole cue out right-to-left. With English: plain text.
 function germanBlock(text) {
   return compactLines(text.split("\n").filter((l) => l.trim()))
-    .map((l) => styled(`‎${l.replace(BIDI, "")}‎`, ""))
+    .map((l) => styled(RTL ? `\u200E${l.replace(BIDI, "")}\u200E` : l.replace(BIDI, ""), ""))
     .join("\n");
 }
 
@@ -691,15 +701,15 @@ function germanOnly(de) {
 
 // ===== Merging ================================================================
 
-// Every Arabic cue goes under the German cue it overlaps most, or the closest one within 1.5 s,
-// so Arabic does not drop out just because the two files are a fraction of a second apart.
+// Every second-language cue goes under the German cue it overlaps most, or the closest one within 1.5 s,
+// so the second language does not drop out just because the two files are a fraction of a second apart.
 function mergeDual(de, arRaw, al) {
   const TOL = 1500;
   const ar = arRaw
     .map((c) => ({
       start: Math.round(al.map(c.start)),
       end: Math.round(al.map(c.end)),
-      text: arabicBlock(c.text)
+      text: secondBlock(c.text)
     }))
     .filter((c) => c.text);
 
@@ -726,9 +736,128 @@ function mergeDual(de, arRaw, al) {
     for (const a of attached[i]) end = Math.max(end, Math.min(a.end, cap, d.end + TOL));
     return { start: d.start, end, text: `${germanBlock(d.text)}\n${attached[i].map((a) => a.text).join("\n")}` };
   });
-  // Arabic cues far from any German cue are kept, so no line is lost.
+  // Cues far from any German cue are kept, so no line is lost.
   for (const a of standalone) out.push({ start: a.start, end: a.end, text: a.text });
   return finalize(out);
+}
+
+// ===== Translation of the German file itself (what the repo does) ============
+// DeepL if DEEPL_KEY is set (official, best quality), otherwise Google's free web endpoint.
+
+async function pool(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  }));
+  return out;
+}
+
+async function deeplChunk(chunk) {
+  const key = process.env.DEEPL_KEY;
+  const host = key.endsWith(":fx") ? "https://api-free.deepl.com" : "https://api.deepl.com";
+  const target = SECOND_LANG === "en" ? "EN-US" : SECOND_LANG.toUpperCase();
+  const r = await fetch(`${host}/v2/translate`, {
+    method: "POST",
+    headers: { Authorization: `DeepL-Auth-Key ${key}`, "Content-Type": "application/json", "User-Agent": UA },
+    body: JSON.stringify({ text: chunk, source_lang: "DE", target_lang: target }),
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!r.ok) throw new Error(`deepl failed: ${r.status}`);
+  const j = await r.json();
+  return (j.translations || []).map((t) => t.text);
+}
+
+async function googleRaw(lines) {
+  const r = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=de&tl=${SECOND_LANG}&dt=t`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0" },
+    body: "q=" + encodeURIComponent(lines.join("\n")),
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!r.ok) throw new Error(`google translate failed: ${r.status}`);
+  const j = await r.json();
+  return (j[0] || []).map((seg) => seg[0] || "").join("").replace(/\n$/, "").split("\n");
+}
+
+async function googleChunk(chunk) {
+  const lines = await googleRaw(chunk);
+  if (lines.length === chunk.length) return lines;
+  // line count got mangled: translate this chunk one line at a time
+  return pool(chunk, 4, async (t) => (await googleRaw([t]))[0] || "");
+}
+
+// texts[i] -> translated text (or "" when it could not be translated)
+async function translateTexts(texts) {
+  const idx = texts.map((t, i) => (t ? i : -1)).filter((i) => i >= 0);
+  const chunks = [];
+  let cur = [], size = 0;
+  const maxItems = process.env.DEEPL_KEY ? 50 : 40;
+  for (const i of idx) {
+    if (cur.length && (cur.length >= maxItems || size + texts[i].length > 3500)) {
+      chunks.push(cur); cur = []; size = 0;
+    }
+    cur.push(i); size += texts[i].length;
+  }
+  if (cur.length) chunks.push(cur);
+
+  const run = process.env.DEEPL_KEY ? deeplChunk : googleChunk;
+  const res = await pool(chunks, 6, async (ids) => {
+    try { return await run(ids.map((i) => texts[i])); }
+    catch (e) { console.error(e); return []; }
+  });
+  const out = texts.map(() => "");
+  chunks.forEach((ids, c) => ids.forEach((i, k) => { out[i] = (res[c] && res[c][k]) || ""; }));
+  return out;
+}
+
+// Dialogue with dashes is translated line by line (separate speakers); a wrapped sentence as one piece.
+function translationUnits(text) {
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  return lines.some((l) => /^(<[^>]+>)*[-\u2013\u2014]/.test(l)) ? lines : [lines.join(" ")];
+}
+
+const trCache = new Map();
+
+// German cue + its own translation: same cue, same timing. Returns null when translating failed.
+async function translatedDual(de) {
+  const flat = [];
+  de.forEach((c, i) => translationUnits(c.text).forEach((t, k) => flat.push({ i, k, t: plain(t).replace(/\s+/g, " ").trim() })));
+  let tr;
+  try { tr = await translateTexts(flat.map((f) => f.t)); } catch (e) { console.error(e); return null; }
+  if (tr.filter(Boolean).length < flat.length * 0.6) return null;
+  const per = de.map(() => []);
+  flat.forEach((f, n) => { if (tr[n]) per[f.i][f.k] = tr[n]; });
+  return finalize(de.map((d, i) => {
+    const second = per[i].filter(Boolean).join("\n");
+    const block = second ? secondBlock(second) : "";
+    return { start: d.start, end: d.end, text: block ? `${germanBlock(d.text)}\n${block}` : d.text };
+  }));
+}
+
+// German + a REAL second-language file. Tries the refs in order; keeps the first that fits the German timing
+// well, otherwise the best-fitting one. Returns null when none is usable.
+async function buildWithFiles(de, refs) {
+  let chosen = null;
+  for (const ref of refs) {
+    let raw;
+    try {
+      raw = parseSrt(await download(ref));
+    } catch (e) {
+      console.error(`second file ${ref.slice(0, 12)} failed:`, e.message || e);
+      continue;
+    }
+    if (raw.length < 5) continue;
+    const al = bestAlignment(de, raw);
+    if (!chosen || al.quality > chosen.al.quality) chosen = { raw, al };
+    if (al.quality >= GOOD_FIT) break;
+  }
+  if (chosen && chosen.al.quality >= MIN_FIT) return mergeDual(de, chosen.raw, chosen.al);
+  console.error(`no usable second-language file (best fit ${chosen ? chosen.al.quality.toFixed(2) : "n/a"})`);
+  return null;
 }
 
 // ===== HTTP handler ==========================================================
@@ -804,14 +933,14 @@ module.exports = async (req, res) => {
       };
       const out = await Promise.all([
         run("os-de-sdh", () => searchLang(type, id, {}, "de", "only", { ai_translated: "exclude", machine_translated: "exclude" })),
-        run("os-ar", () => searchLang(type, id, {}, "ar", ARABIC_SDH_ONLY ? "only" : "include")),
+        run(`os-${SECOND_LANG}`, () => searchLang(type, id, {}, SECOND_LANG, SECOND_SDH_ONLY ? "only" : "include")),
         run("wyzie-de-sdh", () => searchWyzie(type, id, "de", true)),
-        run("wyzie-ar", () => searchWyzie(type, id, "ar", ARABIC_SDH_ONLY)),
+        run(`wyzie-${SECOND_LANG}`, () => searchWyzie(type, id, SECOND_LANG, SECOND_SDH_ONLY)),
         run("subdl-de-sdh", () => searchSubdl(type, id, "de", true)),
-        run("subdl-ar", () => searchSubdl(type, id, "ar", ARABIC_SDH_ONLY))
+        run(`subdl-${SECOND_LANG}`, () => searchSubdl(type, id, SECOND_LANG, SECOND_SDH_ONLY))
       ]);
       return sendJson(res, 200, {
-        osKeySet: !!process.env.OS_API_KEY, wyzieKeySet: !!process.env.WYZIE_KEY, subdlKeySet: !!process.env.SUBDL_KEY, results: out
+        secondLang: SECOND_LANG, mode: SECOND_MODE, deeplKeySet: !!process.env.DEEPL_KEY, osKeySet: !!process.env.OS_API_KEY, wyzieKeySet: !!process.env.WYZIE_KEY, subdlKeySet: !!process.env.SUBDL_KEY, results: out
       });
     }
 
@@ -824,73 +953,85 @@ module.exports = async (req, res) => {
 
       if (id.startsWith("tt") && process.env.OS_API_KEY) {
         const fileTokens = tokens(extra.filename || "");
-        const arHearing = ARABIC_SDH_ONLY;
-        const [deOs, arOs, deWy, arWy, deSd, arSd] = await Promise.all([
+        const wantFiles = SECOND_MODE !== "translate";
+        const none = Promise.resolve([]);
+        const [deOs, seOs, deWy, seWy, deSd, seSd] = await Promise.all([
           safe(searchLang(type, id, extra, "de", "only", { ai_translated: "exclude", machine_translated: "exclude" })),
-          safe(searchLang(type, id, extra, "ar", arHearing ? "only" : "include")),
+          wantFiles ? safe(searchLang(type, id, extra, SECOND_LANG, SECOND_SDH_ONLY ? "only" : "include")) : none,
           safe(searchWyzie(type, id, "de", true)),
-          safe(searchWyzie(type, id, "ar", arHearing)),
+          wantFiles ? safe(searchWyzie(type, id, SECOND_LANG, SECOND_SDH_ONLY)) : none,
           safe(searchSubdl(type, id, "de", true)),
-          safe(searchSubdl(type, id, "ar", arHearing))
+          wantFiles ? safe(searchSubdl(type, id, SECOND_LANG, SECOND_SDH_ONLY)) : none
         ]);
         const de = rank([...deOs, ...deWy, ...deSd], fileTokens, scoreDe);
-        const ar = rank([...arOs, ...arWy, ...arSd], fileTokens, scoreAr);
+        const se = rank([...seOs, ...seWy, ...seSd], fileTokens, scoreSecond);
 
-        // Option 1 = best German + best-rated Arabic. The next ones swap in the 2nd German or the 2nd Arabic.
-        const pairs = [[0, 0], [1, 0], [0, 1], [1, 1], [2, 0], [0, 2]]
-          .filter(([i, j]) => de[i] && ar[j])
-          .slice(0, DUAL_OPTIONS);
-        pairs.forEach(([i, j], n) => {
-          const others = ar.map((_, k) => k).filter((k) => k !== j).slice(0, ARABIC_FALLBACKS);
-          const arRefs = [ar[j].ref, ...others.map((k) => ar[k].ref)];
-          subtitles.push({
-            id: `dual-${n + 1}-${shortId(de[i].ref)}-${shortId(ar[j].ref)}`,
-            url: `${base}/dual/${de[i].ref}~${arRefs.join("~")}.v${CACHE_V}.srt`,
-            lang: "ger"
-          });
+        // translated option: needs only the German file; real files are the fallback if translating fails
+        const trOpt = (i) => ({
+          key: `tr-${shortId(de[i].ref)}`,
+          path: `tr/${de[i].ref}${se.slice(0, FALLBACK_FILES + 1).map((c) => "~" + c.ref).join("")}`
         });
-        // No Arabic exists anywhere for this title: still offer the best German SDH instead of an empty list.
-        if (!pairs.length && de[0]) {
+        // real-file option: the j-th best file first, the others as fallbacks
+        const fileOpt = (i, j) => {
+          const others = se.map((_, k) => k).filter((k) => k !== j).slice(0, FALLBACK_FILES);
+          return {
+            key: `f-${shortId(de[i].ref)}-${shortId(se[j].ref)}`,
+            path: `dual/${de[i].ref}~${[se[j].ref, ...others.map((k) => se[k].ref)].join("~")}`
+          };
+        };
+
+        const opts = [];
+        if (SECOND_MODE === "translate") {
+          for (let i = 0; i < DUAL_OPTIONS; i++) if (de[i]) opts.push(trOpt(i));
+        } else if (SECOND_MODE === "files") {
+          [[0, 0], [1, 0], [0, 1], [1, 1], [2, 0], [0, 2]]
+            .filter(([i, j]) => de[i] && se[j]).slice(0, DUAL_OPTIONS)
+            .forEach(([i, j]) => opts.push(fileOpt(i, j)));
+        } else {
+          // both: 1 = best German + its own translation (perfect sync), 2 = best German + best-rated real file,
+          //       3 = 2nd German + its own translation
+          if (de[0]) opts.push(trOpt(0));
+          if (de[0] && se[0]) opts.push(fileOpt(0, 0));
+          if (de[1]) opts.push(trOpt(1));
+          else if (de[0] && se[1]) opts.push(fileOpt(0, 1));
+        }
+        opts.slice(0, DUAL_OPTIONS).forEach((o, n) => {
+          subtitles.push({ id: `dual-${n + 1}-${o.key}`, url: `${base}/${o.path}.v${CACHE_V}.srt`, lang: "ger" });
+        });
+        // files mode and no second-language file anywhere: still offer the best German SDH
+        if (!subtitles.length && de[0]) {
           subtitles.push({ id: `de-only-${shortId(de[0].ref)}`, url: `${base}/dual/${de[0].ref}.v${CACHE_V}.srt`, lang: "ger" });
         }
       }
       return sendJson(res, 200, { subtitles }, "public, s-maxage=3600");
     }
 
-    if (parts[0] === "dual" && parts[1]) {
-      // /dual/<germanRef>~<arabicRef>[~<fallbackArabicRef>...].vN.srt
+    // /dual/<germanRef>[~<fileRef>...].vN.srt  and  /tr/<germanRef>[~<fallbackFileRef>...].vN.srt
+    if ((parts[0] === "dual" || parts[0] === "tr") && parts[1]) {
       const m = parts[1].match(/^([\w-]+)((?:~[\w-]+)*)(?:\.v\d+)?\.srt$/);
       if (!m) {
         res.statusCode = 400;
         return res.end("Bad id");
       }
       const deRef = m[1];
-      const arRefs = m[2] ? m[2].slice(1).split("~") : [];
-      if (!token && [deRef, ...arRefs].some((r) => /^\d+$/.test(r))) await login();
+      const refs = m[2] ? m[2].slice(1).split("~") : [];
+
+      if (parts[0] === "tr" && trCache.has(deRef)) return sendSrt(res, trCache.get(deRef));
 
       const deText = await download(deRef);
       const de = loadGerman(deText);
       if (!de.length) return sendSrt(res, deText);
 
-      // Try the Arabic candidates in order; keep the first that fits the German timing well,
-      // otherwise the best-fitting one. A failed download no longer silently drops the Arabic.
-      let chosen = null;
-      for (const ref of arRefs) {
-        let arRaw;
-        try {
-          arRaw = parseSrt(await download(ref));
-        } catch (e) {
-          console.error(`arabic ${ref.slice(0, 12)} failed:`, e.message || e);
-          continue;
+      let out = null;
+      if (parts[0] === "tr") {
+        out = await translatedDual(de);
+        if (out) {
+          trCache.set(deRef, out);
+          if (trCache.size > 20) trCache.delete(trCache.keys().next().value);
         }
-        if (arRaw.length < 5) continue;
-        const al = bestAlignment(de, arRaw);
-        if (!chosen || al.quality > chosen.al.quality) chosen = { arRaw, al };
-        if (al.quality >= GOOD_FIT) break;
       }
-      if (chosen && chosen.al.quality >= MIN_FIT) return sendSrt(res, mergeDual(de, chosen.arRaw, chosen.al));
-      console.error(`no usable Arabic file (best fit ${chosen ? chosen.al.quality.toFixed(2) : "n/a"}), serving German only`);
-      return sendSrt(res, germanOnly(de));
+      if (!out) out = await buildWithFiles(de, refs);
+      return sendSrt(res, out || germanOnly(de));
     }
 
     res.statusCode = 404;
