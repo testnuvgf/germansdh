@@ -40,9 +40,9 @@ const SECOND_SDH_ONLY = false;     // true = only use second-language files flag
 const SECOND_COLOR = process.env.SECOND_COLOR || process.env.ARABIC_COLOR || "";   // e.g. "#FFEB3B"; empty = same colour
 const FONT_FACE = process.env.FONT_FACE || "";         // e.g. "Arial"; many players ignore it
 const ALIGN_SECOND = process.env.ALIGN_SECOND !== "0" && process.env.ALIGN_ARABIC !== "0";
-const COMPACT_MAX = 70;            // join a cue's lines into one when the whole thing is this short
-const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 95;
-const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 2800;
+const COMPACT_MAX = 90;            // join a cue's lines into one when the whole thing is this short
+const READ_MS_PER_CHAR = Number(process.env.READ_MS_PER_CHAR) || 100;
+const MIN_CUE_MS = Number(process.env.MIN_CUE_MS) || 1800;
 const MAX_CUE_MS = Number(process.env.MAX_CUE_MS) || 10000;
 const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so they start slightly behind
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
