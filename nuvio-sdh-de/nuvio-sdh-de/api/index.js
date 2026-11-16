@@ -21,12 +21,16 @@
 //           END_PAD_MS (600), BRIDGE_GAP_MS (1000): keep a line on screen a little AFTER the file's end time, and close
 //                        gaps shorter than BRIDGE_GAP_MS between two lines, so text never vanishes while it is still spoken
 //           DRIFT_VARIANTS=0 (optional): hide the two extra "drift" entries in the subtitle list
+//           KEEP_SDH=0 (optional): remove sound descriptions [..], music and speaker names. Default 1 = KEEP them (SDH)
+//           SPLIT (default 2): 2 = one speaker / one sentence per subtitle, 1 = one speaker per subtitle, 0 = as in the file
+//           PLAIN_OPTIONS (default 2, 0-5): how many normal non-SDH German subtitles are listed after the SDH ones, labelled "noSDH"
+//           SDH_CHECK=0 (optional): do not check that the German file really contains sound descriptions
 //           SECOND_COLOR, FONT_FACE, ALIGN_SECOND=0 (optional look & feel)
 //
 // Settings WITHOUT redeploying: put them in the install link, e.g.
 //   https://YOUR-APP.vercel.app/s_pad900_lead0_off-300/manifest.json          (no secret)
 //   https://YOUR-APP.vercel.app/YOUR_SECRET/s_pad900_lead0_off-300/manifest.json
-// keys: pad, bridge (ms) | lead (ms early) | off (ms, + = later) | ratio (drift, 1.04271 / 0.95904)
+// keys: pad, bridge (ms) | lead (ms early) | off (ms, + = later) | ratio (drift, 1.04271 / 0.95904) | sdh (0/1) | split (0/1/2)
 //       read (ms per char) | min, max (ms on screen). Remove and re-add the addon in Nuvio after changing the link.
 //           OS_API_BASE, WYZIE_BASE (testing only)
 
@@ -34,7 +38,7 @@ const crypto = require("crypto");
 const { AsyncLocalStorage } = require("async_hooks");
 const zlib = require("zlib");
 
-const UA = "NuvioSdhDe v2.9.0";
+const UA = "NuvioSdhDe v2.11.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
@@ -61,7 +65,7 @@ const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so t
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
 const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
-const CACHE_V = "17";              // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "19";              // bump to force players/CDN to re-fetch subtitle files
 const LEAD_MS = process.env.LEAD_MS === undefined ? 350 : Number(process.env.LEAD_MS) || 0;   // show each cue this much BEFORE its start
 const LINE_MAX = Number(process.env.LINE_MAX) || 84;   // one line per language up to this many characters (about 95 % of the picture width); longer ones are broken in two. Lower it if your player wraps lines early.
 // a cue of at most this many words that continues the previous (unfinished) sentence is merged into it; 0 = off
@@ -78,12 +82,20 @@ const DRIFT_VARIANTS = process.env.DRIFT_VARIANTS !== "0";   // two extra list e
 // (see the header). AsyncLocalStorage keeps concurrent requests from seeing each other's settings.
 const DEFAULT_CFG = {
   read: READ_MS_PER_CHAR, min: MIN_CUE_MS, max: MAX_CUE_MS, lead: LEAD_MS,
-  off: SYNC_OFFSET_MS, ratio: SYNC_RATIO, pad: END_PAD_MS, bridge: BRIDGE_GAP_MS
+  off: SYNC_OFFSET_MS, ratio: SYNC_RATIO, pad: END_PAD_MS, bridge: BRIDGE_GAP_MS,
+  sdh: process.env.KEEP_SDH === "0" ? 0 : 1,
+  split: process.env.SPLIT === undefined ? 2 : Math.min(2, Math.max(0, Math.round(Number(process.env.SPLIT)) || 0)),
+  sdhcheck: process.env.SDH_CHECK === "0" ? 0 : 1,
+  // plain = how many NORMAL (non-SDH) German subtitles are listed after the SDH ones, labelled "noSDH" (0 = none)
+  plain: process.env.PLAIN_OPTIONS === undefined ? 2 : Math.min(5, Math.max(0, Math.round(Number(process.env.PLAIN_OPTIONS)) || 0))
 };
 const CFG_LIMITS = {
   read: [0, 300], min: [0, 8000], max: [1000, 20000], lead: [0, 2000],
-  off: [-60000, 60000], ratio: [0.9, 1.1], pad: [0, 3000], bridge: [0, 3000]
+  off: [-60000, 60000], ratio: [0.9, 1.1], pad: [0, 3000], bridge: [0, 3000],
+  sdh: [0, 1], split: [0, 2], sdhcheck: [0, 1], plain: [0, 5]
 };
+// A file name that says SDH / HoH / hearing impaired (used when a source cannot tell us the flag).
+const SDH_NAME = /(^|[^a-z0-9])(sdh|hoh|hearing[ ._-]?impaired)([^a-z0-9]|$)/i;
 const cfgStore = new AsyncLocalStorage();
 const currentCfg = () => cfgStore.getStore() || DEFAULT_CFG;
 const CFG_SEG = /^s_[a-z0-9_.-]+$/i;
@@ -107,7 +119,7 @@ const wyzieBase = process.env.WYZIE_BASE || WYZIE_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "2.9.0",
+  version: "2.11.0",
   name: "German SDH + English (dual)",
   description: "German SDH (spoken words) on top, English underneath, in one subtitle. Sources: OpenSubtitles, Wyzie, SubDL.",
   resources: ["subtitles"],
@@ -257,7 +269,9 @@ async function searchWyzie(type, id, lang, hearing) {
     });
   // keep only flagged hearing-impaired files when the API tells us which ones they are
   const known = items.some((d) => hiFlag(d) !== undefined);
-  if (hearing && known) items = items.filter((d) => hiFlag(d) === true);
+  const named = (d) => SDH_NAME.test([d.release, d.fileName, d.matchedRelease, d.media].filter(Boolean).join(" "));
+  // a hearing-impaired search keeps ONLY files the source flags as SDH, or whose name says so; never unflagged ones
+  if (hearing) items = items.filter((d) => (known && hiFlag(d) === true) || named(d));
 
   return items.map((d) => ({
     ref: "w" + b64(d.url),
@@ -268,7 +282,7 @@ async function searchWyzie(type, id, lang, hearing) {
     trusted: false,
     hashMatch: false,
     machine: false,
-    hiUnknown: hearing && !known
+    hiUnknown: false
   }));
 }
 
@@ -299,7 +313,8 @@ async function searchSubdl(type, id, lang, hearing) {
     .filter((d) => d && typeof d.url === "string" && SUBDL_PATH.test(d.url) && !d.full_season)
     .filter((d) => !/^[a-z]{2}$/i.test(String(d.language || "")) || String(d.language).toUpperCase() === L);
   const known = items.some((d) => typeof d.hi === "boolean");
-  if (hearing && known) items = items.filter((d) => d.hi === true);
+  const named = (d) => SDH_NAME.test([d.release_name, d.name].filter(Boolean).join(" "));
+  if (hearing) items = items.filter((d) => (known && d.hi === true) || named(d));
 
   return items.map((d) => ({
     ref: "s" + b64(`${d.url}|${season || ""}|${episode || ""}`),
@@ -310,7 +325,7 @@ async function searchSubdl(type, id, lang, hearing) {
     trusted: false,
     hashMatch: false,
     machine: false,
-    hiUnknown: hearing && !known
+    hiUnknown: false
   }));
 }
 
@@ -508,17 +523,22 @@ function balanceTags(line) {
   }, line);
 }
 
-// Returns the spoken lines of one cue (possibly none).
+// Returns the lines of one cue (possibly none). With sdh=1 (default) sound descriptions [..], music and speaker names are
+// KEPT, because that is exactly what a deaf viewer needs; with sdh=0 only the spoken words stay.
 function cleanLines(text, german) {
+  const keep = currentCfg().sdh === 1;
+  const tidy = (l) => balanceTags(l.replace(/<(\w+)[^>]*>\s*<\/\1>/g, "").replace(/\s{2,}/g, " ").trim());
+  const nonEmpty = (l) => plain(l).replace(/^[-\u2013\u2014\s]+$/, "").trim();
+  if (keep) return text.split("\n").map(tidy).filter(nonEmpty);
   const before = text.split("\n").filter((l) => l.trim()).length;
   const lines = stripNoise(text)
     .split("\n")
-    .filter((l) => !/[♪♫]/.test(l) && !/^\s*#.*#?\s*$/.test(l))
+    .filter((l) => !/[\u266A\u266B]/.test(l) && !/^\s*#.*#?\s*$/.test(l))
     .map((l) => (german ? l.replace(SPEAKER, "$1") : l))
-    .map((l) => balanceTags(l.replace(/<(\w+)[^>]*>\s*<\/\1>/g, "").replace(/\s{2,}/g, " ").trim()))
-    .filter((l) => plain(l).replace(/^[-–—\s]+$/, "").trim());
+    .map(tidy)
+    .filter(nonEmpty);
   // the other speaker's line was sound-only: a lone dialogue dash makes no sense any more
-  if (before > 1 && lines.length === 1) lines[0] = lines[0].replace(/^((?:<[^>]+>)*)[-–—]\s*/, "$1");
+  if (before > 1 && lines.length === 1) lines[0] = lines[0].replace(/^((?:<[^>]+>)*)[-\u2013\u2014]\s*/, "$1");
   return lines;
 }
 
@@ -564,7 +584,7 @@ function mergeOrphans(cues) {
     if (prev && ORPHAN_WORDS) {
       const a = plain(prev.text).trim(), b = plain(c.text).trim();
       const small = wordCount(b) <= ORPHAN_WORDS || wordCount(a) <= ORPHAN_WORDS;
-      if (small && !SENTENCE_END.test(a) && c.start - prev.end <= 700 && !hasDash(prev.text) && !hasDash(c.text) && a.length + b.length <= 90) {
+      if (small && !SENTENCE_END.test(a) && c.start - prev.end <= 700 && !hasDash(prev.text) && !hasDash(c.text) && a.length + b.length <= 90 && !isSoundCue(prev.text) && !isSoundCue(c.text)) {
         prev.text = `${prev.text.replace(/\n/g, " ")} ${c.text.replace(/\n/g, " ")}`;
         prev.end = Math.max(prev.end, c.end);
         continue;
@@ -574,6 +594,92 @@ function mergeOrphans(cues) {
   }
   return out;
 }
+
+// Does this German file really contain SDH information (sound descriptions, music, speaker names)?
+// A real SDH file has them in a few percent of its cues; a normal subtitle file has almost none.
+function looksSdh(cues) {
+  let marks = 0;
+  for (const c of cues) {
+    if (/[\[(♪♫]/.test(c.text) || c.text.split("\n").some((l) => SPEAKER.test(l))) marks++;
+  }
+  return marks >= Math.max(3, Math.round(cues.length * 0.012));
+}
+
+// When no German file with SDH information could be found, say so in the first quiet moment instead of staying silent.
+function withNotice(srt) {
+  const cues = parseSrt(srt);
+  let prevEnd = 0;
+  for (let i = 0; i < cues.length && cues[i].start < 15 * 60 * 1000; i++) {
+    if (cues[i].start - prevEnd >= 2600) {
+      const start = prevEnd + 100;
+      cues.splice(i, 0, {
+        start,
+        end: Math.min(cues[i].start - 100, start + 5000),
+        text: "Hinweis: Diese Datei enth\u00E4lt kaum Ger\u00E4uschbeschreibungen (evtl. kein echtes SDH). Bitte einen anderen Eintrag w\u00E4hlen.\n\u200BNote: this file has hardly any sound descriptions (it may not be true SDH). Try another entry."
+      });
+      return toSrt(cues);
+    }
+    prevEnd = Math.max(prevEnd, cues[i].end);
+  }
+  return srt;
+}
+
+// ---- one speaker / one sentence per subtitle ---------------------------------------------------
+const ABBR = /(?:^|[\s(\[])(?:dr|hr|hrn|fr|frl|prof|nr|st|bzw|usw|ca|etc|vgl|evtl|ggf|sog|mr|mrs|ms|jr|sr)\.$/i;
+const DOTTED = /(?:z\.\s?B|d\.\s?h|u\.\s?a|i\.\s?d\.\s?R|u\.\s?s\.\s?w|o\.\s?ä|z\.\s?T)\.$/i;
+
+// Splits one line into sentences. Never after an abbreviation ("Dr."), an initial ("J."), a number ("3.") or an ellipsis.
+function sentencesOf(line) {
+  const out = [];
+  const re = /([.?!…]+["'»“”’)\]]*)\s+(?=(?:<[^>]+>)*["'»„“(\[]?[A-ZÄÖÜ0-9])/g;
+  let last = 0, m;
+  while ((m = re.exec(line))) {
+    const before = line.slice(0, m.index + 1);
+    if (/\.\.\.|…/.test(m[1])) continue;
+    if (m[1][0] === "." && (ABBR.test(before) || DOTTED.test(before) || /(?:^|\s)[A-ZÄÖÜ]\.$/.test(before) || /\d\.$/.test(before))) continue;
+    out.push(line.slice(last, m.index + m[1].length).trim());
+    last = m.index + m[0].length;
+  }
+  out.push(line.slice(last).trim());
+  return out.filter(Boolean);
+}
+
+const MIN_PART_MS = 900;   // a part shorter than this on screen cannot be read: then the cue stays as one block
+
+// One cue -> one cue per speaker (SPLIT >= 1) and per sentence (SPLIT = 2). The file's time is shared in proportion to the
+// text length, which is a good guess for when each part is spoken. A cue too short to share is left alone.
+function splitCue(c) {
+  const mode = currentCfg().split;
+  if (!mode) return [c];
+  const lines = c.text.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return [c];
+  let units = [];
+  if (lines.some(isDashLine)) {
+    for (const l of lines) {
+      if (isDashLine(l) || !units.length) units.push(l);
+      else units[units.length - 1] += " " + l;   // the file wrapped one speaker's line
+    }
+  } else {
+    units = [lines.join(" ")];
+  }
+  if (mode >= 2) units = units.flatMap(sentencesOf);
+  if (units.length < 2) return [c];
+
+  const weights = units.map((u) => Math.max(10, plain(u).length));
+  const total = weights.reduce((a, b) => a + b, 0);
+  const span = c.end - c.start;
+  if (weights.some((w) => (span * w) / total < MIN_PART_MS)) return [c];
+
+  let acc = 0;
+  return units.map((u, i) => {
+    const start = Math.round(c.start + (span * acc) / total);
+    acc += weights[i];
+    const end = i === units.length - 1 ? c.end : Math.round(c.start + (span * acc) / total) - 60;
+    return { start, end, text: balanceTags(u) };
+  });
+}
+
+const splitCues = (cues) => cues.flatMap(splitCue);
 
 // parse + clean + glue fragments; falls back to the uncleaned cues if cleaning would remove everything
 function loadGerman(text) {
@@ -788,7 +894,11 @@ function fixDurations(cues) {
     const next = cues[i + 1];
     if (!next) { c.end += cfg.pad; continue; }
     const room = next.start - 60;
-    if (room <= c.end) continue;
+    if (room <= c.end) {
+      // touching or just overlapping the next cue (the "lead" can cause this): restore the 60 ms gap
+      if (c.end - room <= 120 && room - c.start >= 400) c.end = room;
+      continue;
+    }
     c.end = next.start - c.end <= cfg.bridge ? room : Math.min(c.end + cfg.pad, room);
   }
   return cues;
@@ -999,7 +1109,8 @@ const trCache = new Map();   // German ref -> translated text per German cue (in
 
 // Translated text for every German cue, or null when translating failed.
 async function getTranslations(deRef, de) {
-  if (trCache.has(deRef)) return trCache.get(deRef);
+  const cacheId = `${deRef}|${currentCfg().split}|${currentCfg().sdh}`;
+  if (trCache.has(cacheId)) return trCache.get(cacheId);
   const units = translationPlan(de);
   let tr;
   try { tr = await translateTexts(units.map((u) => plain(u.text).replace(/\s+/g, " ").trim())); } catch (e) { console.error(e); return null; }
@@ -1012,7 +1123,7 @@ async function getTranslations(deRef, de) {
     else shareOut(tr[n], u.cues.map((j) => plain(de[j].text).length)).forEach((part, k) => { if (part) per[u.cues[k]][0] = part; });
   });
   const second = per.map((p) => p.filter(Boolean).join("\n"));
-  trCache.set(deRef, second);
+  trCache.set(cacheId, second);
   if (trCache.size > 10) trCache.delete(trCache.keys().next().value);
   return second;
 }
@@ -1184,6 +1295,14 @@ module.exports = async (req, res) => {
         const fileTokens = tokens(extra.filename || "");
         const wantFiles = SECOND_MODE !== "translate";
         const none = Promise.resolve([]);
+        // normal German files (not necessarily SDH), searched at the same time
+        const plainP = cfg.plain > 0
+          ? Promise.all([
+              safe(searchLang(type, id, extra, "de", "include", { ai_translated: "exclude", machine_translated: "exclude" })),
+              safe(searchWyzie(type, id, "de", false)),
+              safe(searchSubdl(type, id, "de", false))
+            ])
+          : Promise.resolve([[], [], []]);
         const [deOs, seOs, deWy, seWy, deSd, seSd] = await Promise.all([
           safe(searchLang(type, id, extra, "de", "only", { ai_translated: "exclude", machine_translated: "exclude" })),
           wantFiles ? safe(searchLang(type, id, extra, SECOND_LANG, SECOND_SDH_ONLY ? "only" : "include")) : none,
@@ -1193,19 +1312,26 @@ module.exports = async (req, res) => {
           wantFiles ? safe(searchSubdl(type, id, SECOND_LANG, SECOND_SDH_ONLY)) : none
         ]);
         const de = rank([...deOs, ...deWy, ...deSd], fileTokens, scoreDe);
+        const [pOs, pWy, pSd] = await plainP;
+        const sdhRefs = new Set(de.map((c) => c.ref));
+        const plainDe = rank([...pOs, ...pWy, ...pSd].filter((c) => !sdhRefs.has(c.ref)), fileTokens, scoreDe)
+          .slice(0, cfg.plain).map((c) => ({ ...c, plain: true }));
         const se = rank([...seOs, ...seWy, ...seSd], fileTokens, scoreSecond);
 
+        // up to two other German SDH files travel along in the link (~g<ref>): if the chosen file turns out not to
+        // contain real SDH information, the next one is used
+        const alts = (i) => de.filter((_, k) => k !== i).slice(0, 2).map((c) => "~g" + c.ref).join("");
         // translated option: needs only the German file; real files are the fallback if translating fails
         const trOpt = (i) => ({
           de: de[i], kind: "translated",
           key: `tr-${shortId(de[i].ref)}`,
-          path: `tr/${de[i].ref}${se.slice(0, FALLBACK_FILES + 1).map((c) => "~" + c.ref).join("")}`
+          path: `tr/${de[i].ref}${alts(i)}${se.slice(0, FALLBACK_FILES + 1).map((c) => "~" + c.ref).join("")}`
         });
         // translated + re-timed to the best-rated real file (needs a real file to anchor to)
         const anchOpt = (i) => ({
           de: de[i], kind: "retimed",
           key: `tra-${shortId(de[i].ref)}-${shortId(se[0].ref)}`,
-          path: `tra/${de[i].ref}${se.slice(0, FALLBACK_FILES + 1).map((c) => "~" + c.ref).join("")}`
+          path: `tra/${de[i].ref}${alts(i)}${se.slice(0, FALLBACK_FILES + 1).map((c) => "~" + c.ref).join("")}`
         });
         // real-file option: the j-th best file first, the others as fallbacks
         const fileOpt = (i, j) => {
@@ -1213,7 +1339,7 @@ module.exports = async (req, res) => {
           return {
             de: de[i], kind: "real-file",
             key: `f-${shortId(de[i].ref)}-${shortId(se[j].ref)}`,
-            path: `dual/${de[i].ref}~${[se[j].ref, ...others.map((k) => se[k].ref)].join("~")}`
+            path: `dual/${de[i].ref}${alts(i)}~${[se[j].ref, ...others.map((k) => se[k].ref)].join("~")}`
           };
         };
 
@@ -1236,9 +1362,18 @@ module.exports = async (req, res) => {
         // The id is what Nuvio shows under "Allemand": make it say which file this is.
         const SRC = { os: "OpenSubtitles", wyzie: "Wyzie", subdl: "SubDL" };
         const labelOf = (o, n, extraTag) =>
-          `${n + 1}-${SRC[o.de.source] || o.de.source}${o.de.hashMatch ? "-exact-match" : ""}-${o.kind}${extraTag || ""}-${shortId(o.key).slice(0, 4)}`;
+          `${n + 1}-${SRC[o.de.source] || o.de.source}${o.de.hashMatch ? "-exact-match" : ""}-${o.kind}${o.de.plain ? "-noSDH" : ""}${extraTag || ""}-${shortId(o.key).slice(0, 4)}`;
         opts.slice(0, DUAL_OPTIONS).forEach((o, n) => {
           subtitles.push({ id: labelOf(o, n), url: `${base}/${o.path}.v${CACHE_V}.srt`, lang: "ger" });
+        });
+        // the normal German files: translated like the others, labelled noSDH (no alternates, no SDH check needed)
+        plainDe.forEach((c) => {
+          const o = {
+            de: c, kind: "translated",
+            key: `tr-${shortId(c.ref)}`,
+            path: `tr/${c.ref}${se.slice(0, FALLBACK_FILES + 1).map((x) => "~" + x.ref).join("")}`
+          };
+          subtitles.push({ id: labelOf(o, subtitles.length), url: `${base}/${o.path}.v${CACHE_V}.srt`, lang: "ger" });
         });
         // Two extra entries: the best file again, with its times stretched. For a delay that GROWS over the film (a fixed
         // delay cannot fix that): "early-drift" = text gets earlier and earlier, "late-drift" = later and later.
@@ -1253,8 +1388,8 @@ module.exports = async (req, res) => {
           });
         }
         // files mode and no second-language file anywhere: still offer the best German SDH
-        if (!subtitles.length && de[0]) {
-          subtitles.push({ id: `de-only-${shortId(de[0].ref)}`, url: `${base}/dual/${de[0].ref}.v${CACHE_V}.srt`, lang: "ger" });
+        if (!subtitles.length && de[0]) {   // (also reached only when no plain files were found either)
+          subtitles.push({ id: `de-only-${shortId(de[0].ref)}`, url: `${base}/dual/${de[0].ref}${alts(0)}.v${CACHE_V}.srt`, lang: "ger" });
         }
       }
       return sendJson(res, 200, { subtitles }, "public, s-maxage=3600");
@@ -1267,25 +1402,45 @@ module.exports = async (req, res) => {
         res.statusCode = 400;
         return res.end("Bad id");
       }
-      const deRef = m[1];
-      const refs = m[2] ? m[2].slice(1).split("~") : [];
+      const all = m[2] ? m[2].slice(1).split("~") : [];
+      const deAlts = all.filter((r) => r[0] === "g").map((r) => r.slice(1));   // other German files (~g<ref>)
+      const refs = all.filter((r) => r[0] !== "g");                            // second-language files
       const cacheKey = `${cfgSeg}|${parts[0]}/${parts[1]}`;
       if (outCache.has(cacheKey)) return sendSrt(res, outCache.get(cacheKey));
 
-      const deText = await download(deRef);
+      // The German file: the first one that really contains SDH information. If none does, the first one that downloads.
+      let pick = null, firstOk = null, lastErr = null;
+      for (const r of [m[1], ...deAlts]) {
+        let text;
+        try { text = await download(r); } catch (e) { lastErr = e; console.error(`german file ${r.slice(0, 12)} failed:`, e.message || e); continue; }
+        const raw = parseSrt(text);
+        if (!raw.length) continue;
+        const cand = { ref: r, text };
+        if (!firstOk) firstOk = cand;
+        if (!cfg.sdhcheck || looksSdh(raw)) { pick = cand; break; }
+        console.error(`german file ${r.slice(0, 12)} has no sound descriptions / speaker names, trying the next one`);
+      }
+      const notSdh = !pick && !!firstOk;
+      pick = pick || firstOk;
+      if (!pick) throw lastErr || new Error("no german file");
+
+      const deRef = pick.ref;
+      const deText = pick.text;
       const de = loadGerman(deText);
       if (!de.length) return sendSrt(res, deText);
 
       let out = null;
       if (parts[0] !== "dual") {
-        const second = await getTranslations(deRef, de);
+        const deT = splitCues(de);   // one speaker / sentence per subtitle, each with its own translation
+        const second = await getTranslations(deRef, deT);
         if (second) {
           const al = parts[0] === "tra" ? await anchorMap(de, refs) : null;
-          out = buildTranslated(al ? shift(de, al) : de, second);
+          out = buildTranslated(al ? shift(deT, al) : deT, second);
         }
       }
       if (!out) out = await buildWithFiles(de, refs, parts[0] !== "tr" && ANCHOR_SECOND);
       out = out || germanOnly(de);
+      if (notSdh) out = withNotice(out);
       outCache.set(cacheKey, out);
       if (outCache.size > 30) outCache.delete(outCache.keys().next().value);
       return sendSrt(res, out);
