@@ -12,6 +12,8 @@
 //
 // Env vars: OS_API_KEY, OS_USERNAME, OS_PASSWORD (required)
 //           DEEPL_KEY    (optional, recommended: DeepL translation; otherwise Google's free web endpoint is used)
+//           AZURE_TRANSLATOR_KEY, AZURE_TRANSLATOR_REGION (optional backup translator, free 2M characters/month)
+//           MYMEMORY_EMAIL (optional: any e-mail, raises the free MyMemory backup to ~50,000 characters/day)
 //           SECOND_LANG  (default "en"; any 2-letter code, "ar" keeps the right-to-left handling)
 //           SECOND_MODE  (both | translate | files)
 //           WYZIE_KEY, SUBDL_KEY (optional extra sources)
@@ -41,7 +43,7 @@ const crypto = require("crypto");
 const { AsyncLocalStorage } = require("async_hooks");
 const zlib = require("zlib");
 
-const UA = "NuvioSdhDe v2.12.3";
+const UA = "NuvioSdhDe v2.13.0";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
@@ -122,7 +124,7 @@ const wyzieBase = process.env.WYZIE_BASE || WYZIE_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "2.12.3",
+  version: "2.13.0",
   name: "German SDH + English (dual)",
   description: "German SDH (spoken words) on top, English underneath, in one subtitle. Sources: OpenSubtitles, Wyzie, SubDL.",
   resources: ["subtitles"],
@@ -1037,48 +1039,43 @@ async function googleChunk(chunk) {
   return pool(chunk, 4, async (t) => (await googleRaw([t]))[0] || "");
 }
 
-// ---- backup translators that need no key. Order: DeepL (if DEEPL_KEY) > Google > Microsoft Edge > MyMemory.
+// ---- backup translators that need no key. Order: DeepL (DEEPL_KEY) > Azure Translator (AZURE_TRANSLATOR_KEY) > Google > MyMemory.
 // A translator that fails is skipped for a few minutes, so a blocked one does not slow every request down.
-const EDGE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36 Edg/130.0";
-let edgeTok = null;
-async function edgeToken() {
-  if (edgeTok && Date.now() < edgeTok.exp) return edgeTok.tok;
-  const r = await fetch("https://edge.microsoft.com/translate/auth", { headers: { "User-Agent": EDGE_UA }, signal: AbortSignal.timeout(8000) });
-  if (!r.ok) throw new Error(`edge auth failed: ${r.status}`);
-  const tok = (await r.text()).trim();
-  if (!tok) throw new Error("edge auth: empty token");
-  edgeTok = { tok, exp: Date.now() + 8 * 60 * 1000 };
-  return tok;
-}
-async function edgeChunk(chunk) {
-  const tok = await edgeToken();
+// Microsoft Azure Translator (official, free tier F0 = 2,000,000 characters/month): AZURE_TRANSLATOR_KEY + AZURE_TRANSLATOR_REGION
+async function azureChunk(chunk) {
   const to = SECOND_LANG === "zh" ? "zh-Hans" : SECOND_LANG;
-  const r = await fetch(`https://api-edge.cognitive.microsofttranslator.com/translate?api-version=3.0&from=de&to=${encodeURIComponent(to)}`, {
+  const r = await fetch(`https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from=de&to=${encodeURIComponent(to)}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json", "User-Agent": EDGE_UA },
+    headers: {
+      "Ocp-Apim-Subscription-Key": process.env.AZURE_TRANSLATOR_KEY,
+      "Ocp-Apim-Subscription-Region": process.env.AZURE_TRANSLATOR_REGION || "global",
+      "Content-Type": "application/json", "User-Agent": UA
+    },
     body: JSON.stringify(chunk.map((Text) => ({ Text }))),
     signal: AbortSignal.timeout(15000)
   });
-  if (!r.ok) { if (r.status === 401) edgeTok = null; throw new Error(`edge translate failed: ${r.status}`); }
+  if (!r.ok) throw new Error(`azure translate failed: ${r.status}`);
   const j = await r.json();
   return j.map((x) => (x.translations && x.translations[0] && x.translations[0].text) || "");
 }
 async function myMemoryChunk(chunk) {
   return pool(chunk, 4, async (t) => {
-    const r = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(t.slice(0, 450))}&langpair=de|${SECOND_LANG}`, {
+    // MYMEMORY_EMAIL (any e-mail) raises the free limit from about 5,000 to 50,000 characters per day
+    const mail = process.env.MYMEMORY_EMAIL ? `&de=${encodeURIComponent(process.env.MYMEMORY_EMAIL)}` : "";
+    const r = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(t.slice(0, 450))}&langpair=de|${SECOND_LANG}${mail}`, {
       headers: { "User-Agent": UA }, signal: AbortSignal.timeout(10000)
     });
     if (!r.ok) throw new Error(`mymemory failed: ${r.status}`);
     const j = await r.json();
     const txt = j && j.responseData && j.responseData.translatedText;
     if (!txt || /MYMEMORY WARNING|QUERY LENGTH LIMIT/i.test(txt)) throw new Error("mymemory: " + String(txt || j.responseDetails || "no answer").slice(0, 80));
-    return txt;
+    return txt.trim();
   });
 }
 const TR_PROVIDERS = [
   { name: "deepl", on: () => !!process.env.DEEPL_KEY, run: deeplChunk },
-  { name: "google", run: googleChunk },
-  { name: "edge", run: edgeChunk },
+  { name: "azure", on: () => !!process.env.AZURE_TRANSLATOR_KEY, run: azureChunk },
+  { name: "google", run: googleChunk },     // free web endpoint: usually refuses Vercel's IPs (429), kept as a cheap try
   { name: "mymemory", run: myMemoryChunk }
 ];
 const trBad = {};       // provider -> skip until (ms)
