@@ -24,6 +24,7 @@
 //           KEEP_SDH=0 (optional): remove sound descriptions [..], music and speaker names. Default 1 = KEEP them (SDH)
 //           SPLIT (default 2): 2 = one speaker / one sentence per subtitle, 1 = one speaker per subtitle, 0 = as in the file
 //           PLAIN_OPTIONS (default 2, 0-5): how many normal non-SDH German subtitles are listed after the SDH ones, labelled "noSDH"
+//           MY_SUBS_REPO (optional): "user/repo": list your own transcripts (my-subtitles/<id>.srt) first as "My-transcript"
 //           SDH_CHECK=0 (optional): do not check that the German file really contains sound descriptions
 //           SECOND_COLOR, FONT_FACE, ALIGN_SECOND=0 (optional look & feel)
 //
@@ -34,11 +35,13 @@
 //       read (ms per char) | min, max (ms on screen). Remove and re-add the addon in Nuvio after changing the link.
 //           OS_API_BASE, WYZIE_BASE (testing only)
 
+// MY_SUBS_REPO = "user/repo" (public GitHub repo). Files from the transcription tool, my-subtitles/<imdb id>.srt (series:
+// tt1234567_1_2.srt), are listed first as "My-transcript". MY_SUBS_BRANCH (main), MY_SUBS_DIR (my-subtitles).
 const crypto = require("crypto");
 const { AsyncLocalStorage } = require("async_hooks");
 const zlib = require("zlib");
 
-const UA = "NuvioSdhDe v2.11.0";
+const UA = "NuvioSdhDe v2.12.3";
 const API_DEFAULT = "https://api.opensubtitles.com/api/v1";
 const WYZIE_DEFAULT = "https://sub.wyzie.io";
 const SUBDL_API = "https://api.subdl.com/api/v1/subtitles";
@@ -65,7 +68,7 @@ const OTHER_SOURCE_PENALTY = 10;   // Wyzie / SubDL files carry no ratings, so t
 const SYNC_OFFSET_MS = Number(process.env.SYNC_OFFSET_MS) || 0;
 // Stretch all times (drift that grows over the film): 25 -> 23.976 fps = 1.04271, 23.976 -> 25 = 0.95904.
 const SYNC_RATIO = Number(process.env.SYNC_RATIO) || 1;
-const CACHE_V = "19";              // bump to force players/CDN to re-fetch subtitle files
+const CACHE_V = "21";              // bump to force players/CDN to re-fetch subtitle files
 const LEAD_MS = process.env.LEAD_MS === undefined ? 350 : Number(process.env.LEAD_MS) || 0;   // show each cue this much BEFORE its start
 const LINE_MAX = Number(process.env.LINE_MAX) || 84;   // one line per language up to this many characters (about 95 % of the picture width); longer ones are broken in two. Lower it if your player wraps lines early.
 // a cue of at most this many words that continues the previous (unfinished) sentence is merged into it; 0 = off
@@ -119,7 +122,7 @@ const wyzieBase = process.env.WYZIE_BASE || WYZIE_DEFAULT;
 
 const MANIFEST = {
   id: "community.opensubtitles.sdh.de",
-  version: "2.11.0",
+  version: "2.12.3",
   name: "German SDH + English (dual)",
   description: "German SDH (spoken words) on top, English underneath, in one subtitle. Sources: OpenSubtitles, Wyzie, SubDL.",
   resources: ["subtitles"],
@@ -257,6 +260,7 @@ async function searchWyzie(type, id, lang, hearing) {
     delete params.source;
     r = await call(params);
   }
+  if (r.status === 404) return [];   // Wyzie answers 404 when it simply has nothing for this title
   if (!r.ok) throw new Error(`wyzie search failed (${lang}): ${r.status}`);
   const list = await r.json();
   if (!Array.isArray(list)) return [];
@@ -307,7 +311,13 @@ async function searchSubdl(type, id, lang, hearing) {
   });
   if (!r.ok) throw new Error(`subdl search failed (${lang}): ${r.status}`);
   const j = await r.json();
-  if (!j || j.status === false) return [];
+  if (!j) return [];
+  if (j.status === false) {
+    // "nothing found" is normal; anything else (bad key, rate limit...) is shown by /debug instead of staying silent
+    const msg = String(j.error || j.message || "status false");
+    if (/not ?found|can.?t find|no (subtitle|result)/i.test(msg)) return [];
+    throw new Error("subdl: " + msg.slice(0, 120));
+  }
 
   let items = (j.subtitles || [])
     .filter((d) => d && typeof d.url === "string" && SUBDL_PATH.test(d.url) && !d.full_season)
@@ -1027,6 +1037,71 @@ async function googleChunk(chunk) {
   return pool(chunk, 4, async (t) => (await googleRaw([t]))[0] || "");
 }
 
+// ---- backup translators that need no key. Order: DeepL (if DEEPL_KEY) > Google > Microsoft Edge > MyMemory.
+// A translator that fails is skipped for a few minutes, so a blocked one does not slow every request down.
+const EDGE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36 Edg/130.0";
+let edgeTok = null;
+async function edgeToken() {
+  if (edgeTok && Date.now() < edgeTok.exp) return edgeTok.tok;
+  const r = await fetch("https://edge.microsoft.com/translate/auth", { headers: { "User-Agent": EDGE_UA }, signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error(`edge auth failed: ${r.status}`);
+  const tok = (await r.text()).trim();
+  if (!tok) throw new Error("edge auth: empty token");
+  edgeTok = { tok, exp: Date.now() + 8 * 60 * 1000 };
+  return tok;
+}
+async function edgeChunk(chunk) {
+  const tok = await edgeToken();
+  const to = SECOND_LANG === "zh" ? "zh-Hans" : SECOND_LANG;
+  const r = await fetch(`https://api-edge.cognitive.microsofttranslator.com/translate?api-version=3.0&from=de&to=${encodeURIComponent(to)}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json", "User-Agent": EDGE_UA },
+    body: JSON.stringify(chunk.map((Text) => ({ Text }))),
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!r.ok) { if (r.status === 401) edgeTok = null; throw new Error(`edge translate failed: ${r.status}`); }
+  const j = await r.json();
+  return j.map((x) => (x.translations && x.translations[0] && x.translations[0].text) || "");
+}
+async function myMemoryChunk(chunk) {
+  return pool(chunk, 4, async (t) => {
+    const r = await fetch(`https://api.mymemory.translated.net/get?q=${encodeURIComponent(t.slice(0, 450))}&langpair=de|${SECOND_LANG}`, {
+      headers: { "User-Agent": UA }, signal: AbortSignal.timeout(10000)
+    });
+    if (!r.ok) throw new Error(`mymemory failed: ${r.status}`);
+    const j = await r.json();
+    const txt = j && j.responseData && j.responseData.translatedText;
+    if (!txt || /MYMEMORY WARNING|QUERY LENGTH LIMIT/i.test(txt)) throw new Error("mymemory: " + String(txt || j.responseDetails || "no answer").slice(0, 80));
+    return txt;
+  });
+}
+const TR_PROVIDERS = [
+  { name: "deepl", on: () => !!process.env.DEEPL_KEY, run: deeplChunk },
+  { name: "google", run: googleChunk },
+  { name: "edge", run: edgeChunk },
+  { name: "mymemory", run: myMemoryChunk }
+];
+const trBad = {};       // provider -> skip until (ms)
+const trLast = {};      // provider -> last error text (shown by /trtest)
+let trUsed = null;      // provider that translated last
+async function translateChunk(lines) {
+  for (const p of TR_PROVIDERS) {
+    if (p.on && !p.on()) continue;
+    if ((trBad[p.name] || 0) > Date.now()) continue;
+    try {
+      const r = await p.run(lines);
+      if (r.length !== lines.length || r.filter(Boolean).length < lines.length * 0.6) throw new Error("answer did not match the request");
+      trUsed = p.name;
+      return r;
+    } catch (e) {
+      trLast[p.name] = String((e && e.message) || e).slice(0, 160);
+      trBad[p.name] = Date.now() + 3 * 60 * 1000;
+      console.error(`translator ${p.name} failed:`, trLast[p.name]);
+    }
+  }
+  return [];
+}
+
 // texts[i] -> translated text (or "" when it could not be translated)
 async function translateTexts(texts) {
   const idx = texts.map((t, i) => (t ? i : -1)).filter((i) => i >= 0);
@@ -1041,11 +1116,7 @@ async function translateTexts(texts) {
   }
   if (cur.length) chunks.push(cur);
 
-  const run = process.env.DEEPL_KEY ? deeplChunk : googleChunk;
-  const res = await pool(chunks, 6, async (ids) => {
-    try { return await run(ids.map((i) => texts[i])); }
-    catch (e) { console.error(e); return []; }
-  });
+  const res = await pool(chunks, 6, async (ids) => translateChunk(ids.map((i) => texts[i])));
   const out = texts.map(() => "");
   chunks.forEach((ids, c) => ids.forEach((i, k) => { out[i] = (res[c] && res[c][k]) || ""; }));
   return out;
@@ -1196,6 +1267,28 @@ function sendJson(res, status, body, cache) {
   res.end(JSON.stringify(body));
 }
 
+// ===== "My transcript": files made by the laptop transcription tool, read from your GitHub repo =====
+const recentReqs = [];   // last subtitle requests (what does the player really send?), see /recent
+const MY_REPO = process.env.MY_SUBS_REPO || "";
+const MY_BRANCH = process.env.MY_SUBS_BRANCH || "main";
+const MY_DIR = process.env.MY_SUBS_DIR || "my-subtitles";
+const mySubKey = (id) => String(id).replace(/[^A-Za-z0-9:_-]/g, "").replace(/:/g, "_");
+const mySubCache = new Map();   // key -> { at, text | null }
+async function mySubText(key) {
+  if (!MY_REPO || !/^tt\d+(_\d+_\d+)?$/.test(key)) return null;
+  const hit = mySubCache.get(key);
+  if (hit && Date.now() - hit.at < 60 * 1000) return hit.text;
+  let text = null;
+  try {
+    const r = await fetch(`https://raw.githubusercontent.com/${MY_REPO}/${MY_BRANCH}/${MY_DIR}/${key}.srt`, {
+      headers: { "User-Agent": UA }, signal: AbortSignal.timeout(6000)
+    });
+    if (r.ok) text = await r.text();
+  } catch (e) { console.error("my transcript fetch failed:", e.message || e); }
+  mySubCache.set(key, { at: Date.now(), text });
+  return text;
+}
+
 function sendSrt(res, text) {
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/x-subrip; charset=utf-8");
@@ -1289,7 +1382,15 @@ module.exports = async (req, res) => {
       const extraRaw = (parts[3] || "").replace(/\.json$/, "");
       const extra = Object.fromEntries(new URLSearchParams(extraRaw));
       const subtitles = [];
-      console.log("extra:", JSON.stringify(extra));   // does the player send videoHash / filename / videoSize?
+      console.log("extra:", JSON.stringify(extra));
+      recentReqs.unshift({ at: new Date().toISOString(), type, id, filename: extra.filename || null });
+      recentReqs.length = Math.min(recentReqs.length, 15);   // does the player send videoHash / filename / videoSize?
+
+      // your own transcript first (made with the laptop tool), if one exists for this movie / episode
+      const myKey = mySubKey(id);
+      if (MY_REPO && id.startsWith("tt") && (await mySubText(myKey))) {
+        subtitles.push({ id: "My-transcript", url: `${root}/my/${myKey}.v${CACHE_V}.srt`, lang: "ger" });
+      }
 
       if (id.startsWith("tt") && process.env.OS_API_KEY) {
         const fileTokens = tokens(extra.filename || "");
@@ -1392,7 +1493,36 @@ module.exports = async (req, res) => {
           subtitles.push({ id: `de-only-${shortId(de[0].ref)}`, url: `${base}/dual/${de[0].ref}${alts(0)}.v${CACHE_V}.srt`, lang: "ger" });
         }
       }
-      return sendJson(res, 200, { subtitles }, "public, s-maxage=3600");
+      return sendJson(res, 200, { subtitles }, MY_REPO ? "public, s-maxage=60" : "public, s-maxage=3600");
+    }
+
+    // /trtest : does translating work from this server? Tries every translator on two sentences (no keys are shown).
+    if (parts[0] === "trtest") {
+      const sample = ["Das stimmt nicht.", "Wo bist du gewesen?"];
+      const out = {};
+      for (const p of TR_PROVIDERS) {
+        if (p.on && !p.on()) { out[p.name] = "not used (no key)"; continue; }
+        const t0 = Date.now();
+        try { out[p.name] = { ok: true, ms: Date.now() - t0, result: await p.run(sample) }; out[p.name].ms = Date.now() - t0; }
+        catch (e) { out[p.name] = { ok: false, ms: Date.now() - t0, error: String((e && e.message) || e).slice(0, 200) }; }
+      }
+      return sendJson(res, 200, { secondLang: SECOND_LANG, lastUsed: trUsed, skippedNow: Object.keys(trBad).filter((k) => trBad[k] > Date.now()), lastErrors: trLast, test: out }, "no-store");
+    }
+
+    // /recent : the last subtitle requests this addon got (id and file name the player sent). For finding the right id.
+    if (parts[0] === "recent") {
+      return sendJson(res, 200, { note: "newest first; the id is what the file name must match (tt1:2:3 -> tt1_2_3.srt)", requests: recentReqs }, "no-store");
+    }
+
+    // /my/<imdb id>.srt : the transcript file from your repo
+    if (parts[0] === "my" && parts[1]) {
+      const key = parts[1].replace(/(?:\.v\d+)?\.srt$/, "");
+      const text = await mySubText(key);
+      if (!text) { res.statusCode = 404; return res.end("No transcript for " + key); }
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/x-subrip; charset=utf-8");
+      res.setHeader("Cache-Control", "public, s-maxage=60, max-age=60");   // short: you may replace the file
+      return res.end(text);
     }
 
     // /dual/<de>[~<file>...] real file merged | /tr/<de>[~<file>...] translated | /tra/<de>~<file>... translated + re-timed
